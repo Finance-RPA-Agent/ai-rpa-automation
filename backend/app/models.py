@@ -1,4 +1,15 @@
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, text
+from datetime import datetime
+
+from sqlalchemy import (
+    Column,
+    Integer,
+    String,
+    Text,
+    DateTime,
+    ForeignKey,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.orm import relationship
 from backend.app.database import Base
 
@@ -101,6 +112,58 @@ class OfficeApproval(Base):
         "Task",
         back_populates="office_approvals"
     )
+
+
+class FinancialRecord(Base):
+    """Simulated BI source for supplier financial records."""
+
+    __tablename__ = "bi_financial_records"
+    __table_args__ = (
+        UniqueConstraint(
+            "supplier_id",
+            "order_id",
+            name="uq_financial_record_business_key",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    supplier_id = Column(String, nullable=False, index=True)
+    supplier_name = Column(String, nullable=False)
+    order_id = Column(String, nullable=False, index=True)
+    amount = Column(String, nullable=False)
+    date = Column(String, nullable=False)
+    payment_status = Column(String, nullable=False)
+    record_status = Column(String, nullable=False)
+    source = Column(String, default="demo_seed")
+    created_at = Column(
+        DateTime, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+    updated_at = Column(
+        DateTime, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
+
+
+class OaReconciliationRecord(Base):
+    """Simulated OA archive for reconciliation results and exceptions."""
+
+    __tablename__ = "oa_reconciliation_records"
+    __table_args__ = (
+        UniqueConstraint(
+            "task_id",
+            "operation_id",
+            name="uq_oa_record_task_operation",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    record_id = Column(String, unique=True, nullable=False, index=True)
+    task_id = Column(Integer, ForeignKey("tasks.id"), nullable=False, index=True)
+    record_type = Column(String, nullable=False)
+    operation_id = Column(String, nullable=False)
+    payload = Column(Text, nullable=False)
+    content_hash = Column(String, nullable=False)
+    review_status = Column(String, nullable=False, default="pending_review")
+    created_at = Column(DateTime, nullable=False, default=datetime.now)
 
 
 class User(Base):

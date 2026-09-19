@@ -1,7 +1,9 @@
+import os
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 
-DATABASE_URL = "sqlite:///./ai_rpa.db"
+DATABASE_URL = os.getenv("RPA_DATABASE_URL", "sqlite:///./ai_rpa.db")
 
 engine = create_engine(
     DATABASE_URL,

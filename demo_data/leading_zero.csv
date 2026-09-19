@@ -1,0 +1,2 @@
+supplier_id,supplier_name,order_id,amount,date,payment_status,record_status
+00123,Zero Ltd,ORD-0007,12.50,2026-09-18,pending,active

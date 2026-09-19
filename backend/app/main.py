@@ -9,6 +9,7 @@ from backend.app.routers import users
 from backend.app.routers import office
 from backend.app.routers import system
 from backend.app.routers import reports
+from backend.app.routers import tools
 
 Base.metadata.create_all(bind=engine)
 
@@ -25,6 +26,7 @@ app.include_router(users.router)
 app.include_router(office.router)
 app.include_router(system.router)
 app.include_router(reports.router)
+app.include_router(tools.router)
 
 
 @app.get("/")

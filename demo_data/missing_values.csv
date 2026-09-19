@@ -1,0 +1,3 @@
+supplier_id,supplier_name,order_id,amount,date,payment_status,record_status
+SUP-003,,ORD-3001,320.75,2026-09-21,paid,active
+SUP-004,Delta Works,ORD-4001,,2026-09-22,overdue,active
