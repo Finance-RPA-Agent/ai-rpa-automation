@@ -1,0 +1,5 @@
+﻿supplier_id,supplier_name,order_id,amount,date,payment_status,record_status
+REVIEW-SUP-001,Example Supplier A,REVIEW-001,100.00,2026-10-01,pending,active
+REVIEW-SUP-002,Example Supplier B,REVIEW-002,125.00,2026-10-02,pending,active
+REVIEW-SUP-003,Example Supplier C,REVIEW-003,200.00,2026-10-03,paid,active
+REVIEW-SUP-004,,REVIEW-004,300.00,2026-10-04,pending,active

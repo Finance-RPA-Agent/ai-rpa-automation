@@ -216,3 +216,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# AI-RPA project local data
+ai_rpa.db
+*.db-journal
+
+# Uploaded files
+uploads/*
+
+# Generated output files
+outputs/*
