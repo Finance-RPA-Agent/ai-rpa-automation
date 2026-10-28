@@ -1,0 +1,36 @@
+{
+  "title": "UCI Online Retail-derived reconciliation benchmark",
+  "citation": "Chen, D. (2015). Online Retail [Dataset]. UCI Machine Learning Repository. https://doi.org/10.24432/C5BW33",
+  "source": "https://archive.ics.uci.edu/dataset/352/online+retail",
+  "download": "https://raw.githubusercontent.com/elastic/eland/main/docs/sphinx/examples/data/online-retail.csv.gz",
+  "download_scope": "Elastic Eland's 15,000-line public sample",
+  "license": "CC BY 4.0",
+  "license_url": "https://creativecommons.org/licenses/by/4.0/",
+  "original_download_sha256": "06c9034deff544271e5b3e555297a0729b4a1a852799357484b77f82223e63a5",
+  "rows": 100,
+  "currency": "GBP (sterling), unchanged; no conversion",
+  "transformations": [
+    "Aggregate positive, non-cancelled invoice line totals by InvoiceNo and CustomerID, using Decimal.",
+    "Use CustomerID as an illustrative counterparty surrogate in supplier_id; this is retail customer data, not real supplier data.",
+    "Create surrogate English counterparty names; convert invoice date to YYYY-MM-DD.",
+    "Construct pending payment_status and active record_status; these statuses are not present in UCI.",
+    "Derive the reference from the same public dataset; it is not independent enterprise BI evidence."
+  ],
+  "injected_findings": [
+    {
+      "working_row": 2,
+      "change": "amount +25 GBP"
+    },
+    {
+      "working_row": 3,
+      "change": "payment_status pending -> paid"
+    },
+    {
+      "working_row": 4,
+      "change": "supplier_name removed"
+    }
+  ],
+  "folder_transformation": "Split the 100 derived source orders into two 50-row CSV files. Retain the same 100-row reference. Deliberate differences are unchanged.",
+  "folder_role": "Input files to process",
+  "layout_note": "Copied without changing rows into separate independently selected folders. The BI reference is derived benchmark data, not an enterprise connection."
+}

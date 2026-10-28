@@ -1,0 +1,14 @@
+{
+  "product": "Finance Flow",
+  "version": "1.0.0",
+  "repository": "https://github.com/Finance-RPA-Agent/ai-rpa-automation",
+  "baseline_commit": "381cc05b84a474024b3540f7ec340821e6740099",
+  "baseline_branch": "feature/agent-runtime-skeleton-v0.1",
+  "product_branch": "feature/local-product-v1",
+  "language": "en",
+  "model": "qwen3.5:4b",
+  "context_tokens": 4096,
+  "active_operations": 1,
+  "reference_connector": "user_imported_bi_export",
+  "archive_connector": "local_reconciliation_archive"
+}

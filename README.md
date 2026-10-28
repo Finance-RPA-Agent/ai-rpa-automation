@@ -1,5 +1,23 @@
 # AI-RPA Finance Automation Platform
 
+## Finance Flow local desktop product
+
+**Folder batches** now scan local CSV/Excel folders, recognize worksheets and common field names,
+match reference tables, automatically archive clean rows, and create review tasks only for exceptions.
+Export a readable Excel report through the native Save As dialog. See the [batch workflow guide](product/README.md#folder-batch-workflow).
+
+The English-only Windows product is in [`product/`](product/README.md). It supports `.xlsx` and
+UTF-8 `.csv` source/reference imports, column mapping, local Ollama planning with `qwen3.5:4b`,
+reviewed execution, persistent corrections, audit reports, CSV exports and a local reconciliation archive.
+It targets an RTX 4060 Laptop and 16 GB RAM. Business data stays local after installation.
+
+Run **Setup Finance Flow.cmd** once, install the model with `ollama pull qwen3.5:4b`, then launch
+**Start Finance Flow.cmd** and create your local account. See the [product guide](product/README.md)
+for the attributed public example data, backup/restore, dependencies and test commands.
+The product uses BI export files and a local archive; enterprise BI/OA connections are not configured.
+
+The sections below describe the original backend MVP and its development interfaces.
+
 ## 1. Project Overview
 
 This project is an AI-agent-based finance cross-system data processing and workflow automation platform.
