@@ -120,6 +120,7 @@ const S = {
   route: "dashboard",
   id: null,
   token: 0,
+  sessionEpoch: 0,
   selected: new Set(),
   tab: "records",
   search: "",
@@ -143,6 +144,7 @@ function toast(message, error = false) {
   toastTimer = setTimeout(() => (element.className = ""), 5000);
 }
 async function api(path, options = {}) {
+  const requestSession = S.sessionEpoch;
   let response;
   try {
     response = await fetch("/api" + path, {
@@ -159,8 +161,12 @@ async function api(path, options = {}) {
     throw new Error("The local service is unavailable. Restart Finance Flow.");
   }
   if (response.status === 401 && path !== "/login" && path !== "/setup") {
-    S.session = { setup_required: false, username: null };
-    render();
+    if (requestSession === S.sessionEpoch) {
+      S.sessionEpoch += 1;
+      if (typeof clearAssistantMemory === "function") clearAssistantMemory();
+      S.session = { setup_required: false, username: null };
+      render();
+    }
     throw new Error("Your session has expired. Please sign in again.");
   }
   let data;
@@ -450,9 +456,11 @@ async function refresh() {
   S.commands = (await api("/commands")).commands;
 }
 async function navigate() {
-  const token = ++S.token;
+  const token = ++S.token, selectionEpoch = A.epoch, sessionEpoch = S.sessionEpoch;
   try {
-    S.session = await api("/session");
+    const session = await api("/session");
+    if (token !== S.token || sessionEpoch !== S.sessionEpoch) return;
+    S.session = session;
     if (!S.session.username) {
       render();
       return;
@@ -478,8 +486,16 @@ async function navigate() {
       ? route
       : "dashboard";
     S.id = /^\d+$/.test(id || "") ? Number(id) : null;
+    if (S.route === "assistant" && !S.id) {
+      const remembered = assistantRememberedChatId();
+      if (remembered) {
+        S.id = remembered;
+        try { history.replaceState(null, "", "#assistant/" + remembered); } catch {}
+      }
+    }
+    if (S.route === "assistant" && S.id) rememberAssistantChat(S.id);
     await refresh();
-    if (token !== S.token) return;
+    if (token !== S.token || sessionEpoch !== S.sessionEpoch) return;
     if (S.route === "task" && S.id) {
       S.task = await api(taskDetailPath(S.id));
       S.selected.clear();
@@ -496,13 +512,14 @@ async function navigate() {
       if (!S.commandBiFolder) S.commandBiFolder = S.biFolderDraft;
     }
     if (S.route === "batch" && S.id) S.batch = await api("/batches/" + S.id);
-    if (S.route === "assistant") await refreshAssistant();
+    if (S.route === "assistant") await refreshAssistant(token, selectionEpoch);
     if (S.route === "archive") S.archive = (await api("/archive")).records;
     if (S.route === "settings") S.model = await api("/model");
-    if (token !== S.token) return;
+    if (token !== S.token || sessionEpoch !== S.sessionEpoch) return;
     render();
     window.scrollTo(0, 0);
   } catch (error) {
+    if (token !== S.token || sessionEpoch !== S.sessionEpoch) return;
     toast(error.message, true);
     if (!S.session?.username) render();
     else
@@ -591,6 +608,8 @@ document.addEventListener("click", async (event) => {
       await batchAction(action, target);
     } else if (action === "close-modal") closeModal();
     else if (action === "logout") {
+      S.sessionEpoch += 1;
+      if (typeof clearAssistantMemory === "function") clearAssistantMemory();
       await post("/logout");
       S.session = { setup_required: false, username: null };
       render();
@@ -722,6 +741,7 @@ document.addEventListener("submit", async (event) => {
         username: document.getElementById("username").value.trim(),
         password: document.getElementById("password").value,
       });
+      S.sessionEpoch += 1;
       await navigate();
     } else if (form.id === "task-form") {
       const task = await post("/tasks", S.draft);
