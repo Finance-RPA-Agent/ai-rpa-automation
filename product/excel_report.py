@@ -27,7 +27,13 @@ def text(value):
 
 
 def numeric_decimal(number):
-    return float(number) if abs(number) < Decimal("10000000000000") else text(number)
+    if abs(number) >= Decimal("10000000000000"):
+        return text(number)
+    candidate = float(number)
+    # openpyxl writes numeric cells with 16 significant digits. Keep a
+    # numeric cell only when its stored value exactly equals the input;
+    # otherwise retain the decimal as text, as for larger amounts above.
+    return candidate if Decimal(format(candidate, ".16g")) == number else text(number)
 
 
 def amount(value):

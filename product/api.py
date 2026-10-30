@@ -405,6 +405,7 @@ def create_app(directory=None, *, model=None):
 
     @app.get("/api/archive")
     def archive(_actor=Depends(account)):
+        service.check_archive_recovery()
         return {"records": [dict(row, data=json.loads(row["payload_json"])) for row in service.store.all("SELECT * FROM archive ORDER BY created_at DESC")]}
 
     @app.get("/api/model")
