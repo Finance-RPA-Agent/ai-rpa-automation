@@ -27,6 +27,55 @@ class OllamaProvider:
         return httpx.Client(base_url=ENDPOINT, timeout=httpx.Timeout(self.timeout, connect=3),
                             transport=self.transport, trust_env=False, follow_redirects=False)
 
+    def explain_issue(self, context, schema):
+        """One bounded local proposal; no retry, tools, free text or execution."""
+        import time
+        from product.issue_explanation import AdviceFailure, strict_json
+
+        if not self.lock.acquire(blocking=False):
+            raise AdviceFailure("model_busy")
+        try:
+            if not self.status()["installed"]:
+                raise AdviceFailure("model_unavailable")
+            budget = min(max(float(self.timeout), 0.1), 45.0)
+            deadline = time.monotonic() + budget
+            with self.client() as client:
+                with client.stream("POST", "/api/chat", timeout=httpx.Timeout(budget, connect=min(3, budget)), json={
+                    "model": MODEL, "stream": False, "think": False, "format": schema,
+                    "messages": [{"role": "system", "content":
+                        "Select evidence focus and safe next-step recommendations for one financial finding. "
+                        "Return only the exact JSON schema. Copy only supplied enum values and IDs. "
+                        "Select useful fact_ids and suggestion_ids. The underlying cause is unknown. "
+                        "You cannot approve, correct values, execute tools, pay, run code, or grant permissions. "
+                        "No free text, extra fields, arithmetic or new facts."},
+                        {"role": "user", "content": json.dumps(context, ensure_ascii=True, allow_nan=False)}],
+                    "options": {"num_ctx": 2048, "num_predict": 240, "temperature": 0}, "keep_alive": "2m",
+                }) as response:
+                    response.raise_for_status()
+                    chunks = bytearray()
+                    for chunk in response.iter_bytes():
+                        if time.monotonic() > deadline:
+                            raise AdviceFailure("model_timeout")
+                        if len(chunks) + len(chunk) > 16384:
+                            raise AdviceFailure("model_rejected")
+                        chunks.extend(chunk)
+            payload = strict_json(bytes(chunks).decode("utf-8"), limit=16384)
+            if (not isinstance(payload, dict) or payload.get("model") != MODEL or payload.get("done") is not True or
+                    payload.get("done_reason") != "stop" or "error" in payload):
+                raise AdviceFailure("model_rejected")
+            message = payload.get("message")
+            if not isinstance(message, dict) or message.get("role") != "assistant" or message.get("tool_calls"):
+                raise AdviceFailure("model_rejected")
+            return message["content"]
+        except httpx.TimeoutException as exc:
+            raise AdviceFailure("model_timeout") from exc
+        except httpx.HTTPError as exc:
+            raise AdviceFailure("model_unavailable") from exc
+        except (ValueError, TypeError, KeyError, RecursionError, UnicodeError) as exc:
+            raise AdviceFailure("model_rejected") from exc
+        finally:
+            self.lock.release()
+
     def status(self):
         try:
             with self.client() as client:

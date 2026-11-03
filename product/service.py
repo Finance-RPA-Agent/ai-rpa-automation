@@ -505,6 +505,43 @@ class ProductService:
                                separators=(",", ":"))
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
+    def _explanation_snapshot(self, job_id, issue_id, revision, evidence):
+        self.check_archive_recovery(job_id)
+        job, state = self.get_job(job_id)
+        if (type(revision) is not int or job["status"] != "waiting_confirmation" or revision != job["revision"] or
+                not isinstance(evidence, str) or evidence != self.review_evidence(job, state)):
+            raise HTTPException(409, "Explanation evidence is stale. Refresh the current task.")
+        issues = [issue for issue in state["issues"] if issue.get("id") == issue_id]
+        if not issues:
+            raise HTTPException(404, "The current finding was not found.")
+        if len(issues) != 1:
+            raise HTTPException(409, "Finding identity is ambiguous.")
+        identities = []
+        try:
+            for role in ("source", "reference"):
+                item = self.file(job[role + "_id"])
+                if (digest(self.path(item["raw_path"])) != item["sha256"] or
+                        digest(self.path(item["canonical_path"])) != item["canonical_sha256"]):
+                    raise ValueError("Stored file changed")
+                identities.append(item)
+            if digest(self.path(state["working_file"])) != state["working_hash"]:
+                raise ValueError("Working file changed")
+        except (OSError, ValueError) as exc:
+            raise HTTPException(409, "Stored explanation evidence changed. Refresh the task.") from exc
+        return {"job": job, "files": identities, "issue": copy.deepcopy(issues[0])}
+
+    def explain_issue(self, job_id, issue_id, revision, evidence):
+        from product.issue_explanation import advise
+        with self.guard:
+            before = self._explanation_snapshot(job_id, issue_id, revision, evidence)
+        # Inference owns neither a business lock nor a database transaction.
+        advice = advise(before["issue"], self.model)
+        with self.guard:
+            after = self._explanation_snapshot(job_id, issue_id, revision, evidence)
+            if before != after:
+                raise HTTPException(409, "The task changed during explanation. Discarded stale advice.")
+            return dict(advice, task_id=job_id, revision=revision, issue_id=issue_id, evidence_digest=evidence)
+
     def review(self, job_id, revision, evidence, changes, reason, actor):
         with self.guard:
             self.check_archive_recovery(job_id)
