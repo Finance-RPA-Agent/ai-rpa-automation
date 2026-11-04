@@ -196,9 +196,27 @@ const post = (path, body = {}) =>
   api(path, { method: "POST", body: JSON.stringify(body) });
 // R3B owns only advice state; navigation/session/review implementations stay separate.
 const issueAdvice = window.FinanceIssueAdvice?.create({
-  getContext: () => ({ session: S.session, token: S.token, hash: location.hash,
+  getContext: () => ({ session: S.session, sessionEpoch: S.sessionEpoch, token: S.token, hash: location.hash,
     route: S.route, view: S.tab, task: S.task, taskId: S.id }),
   request: (path, body, guard) => api(path, { method: "POST", body: JSON.stringify(body), ...guard }),
+  refreshTask: async (id, guard) => {
+    const detail = await api(taskDetailPath(id), guard);
+    if (!guard.isCurrent()) return;
+    if (detail?.id !== id || !Number.isSafeInteger(detail.revision) || !Array.isArray(detail.issues) ||
+        !Array.isArray(detail.decisions)) throw new Error("Invalid task detail.");
+    const previous = S.task, selection = S.selected;
+    S.task = detail;
+    S.selected = new Set();
+    try {
+      render();
+    } catch {
+      // Keep the original refresh gate if the returned detail cannot be displayed.
+      S.task = previous;
+      S.selected = selection;
+      render();
+      toast("The task could not be refreshed. Try Refresh task again.", true);
+    }
+  },
   changed: () => document.querySelectorAll("[data-issue-advice]").forEach(node => {
     const focused = node.contains(document.activeElement);
     node.innerHTML = issueAdvice.render(node.dataset.issueAdvice);
@@ -468,9 +486,12 @@ function archivePage() {
 }
 function settingsPage() {
   const model = S.model || {};
-  return `${heading("Workspace settings", "Local model, data portability and account security.")}<div class="two-col"><div class="stack"><section class="card"><div class="card-head between"><h2>Local AI connection</h2>${badge(model.installed ? "ready" : "pending", model.installed ? "Ready" : "Setup required")}</div><div class="card-body">${[
+  let connection = "Not checked";
+  if (model.available === false) connection = "Service unreachable";
+  if (model.available === true) connection = model.installed ? "Installed" : "Model missing";
+  return `${heading("Workspace settings", "Local model, data portability and account security.")}<div class="two-col"><div class="stack"><section class="card"><div class="card-head between"><h2>Local AI connection</h2>${badge(connection === "Installed" ? "ready" : "pending", connection)}</div><div class="card-body">${[
     ["Provider", "Ollama · loopback only"],
-    ["Model", model.model || "qwen3.5:4b"],
+    ["Model", esc(model.model || "qwen3.5:4b")],
     ["Context window", "8,192 data / 4,096 reconciliation"],
     ["Concurrency", "One active task"],
     ["Cloud inference", "Disabled by application design"],
@@ -481,7 +502,7 @@ function settingsPage() {
     )
     .join(
       "",
-    )}<p class="detail-text space">${esc(model.message || "Checking local service…")}</p><div class="space">${btn(svg("refresh") + " Refresh connection", "refresh-model", "secondary")}</div></div></section><section class="card card-body"><h2>Data backup</h2><div class="space">${btn(svg("download") + " Download backup", "backup", "secondary")}</div></section></div><div class="stack"><section class="card"><div class="card-head"><h2>Change password</h2></div><form class="card-body" id="password-form"><div class="field"><label for="old-password">Current password</label><input id="old-password" class="input" type="password" required autocomplete="current-password"></div><div class="field"><label for="new-password">New password</label><input id="new-password" class="input" type="password" required minlength="6" maxlength="256" autocomplete="new-password"></div><button class="btn secondary" type="submit">Update password</button></form></section></div></div>`;
+    )}<p class="detail-text space">${esc(model.message || "Connection has not been checked yet.")}</p><div class="space">${btn(svg("refresh") + " Refresh connection", "refresh-model", "secondary")}</div></div></section><section class="card card-body"><h2>Data backup</h2><div class="space">${btn(svg("download") + " Download backup", "backup", "secondary")}</div></section></div><div class="stack"><section class="card"><div class="card-head"><h2>Change password</h2></div><form class="card-body" id="password-form"><div class="field"><label for="old-password">Current password</label><input id="old-password" class="input" type="password" required autocomplete="current-password"></div><div class="field"><label for="new-password">New password</label><input id="new-password" class="input" type="password" required minlength="6" maxlength="256" autocomplete="new-password"></div><button class="btn secondary" type="submit">Update password</button></form></section></div></div>`;
 }
 async function refresh() {
   const response = await api("/tasks");
@@ -638,6 +659,8 @@ document.addEventListener("click", async (event) => {
   try {
     if (action === "issue-advice") {
       await issueAdvice.explain(target.dataset.issueId);
+    } else if (action === "refresh-advice-task") {
+      await issueAdvice.refresh(target.dataset.issueId);
     } else if (action.startsWith("assistant-")) {
       await assistantAction(action, target);
     } else if (action.startsWith("command-")) {

@@ -29,8 +29,8 @@ FINDINGS = {
 STATUSES = {
     "advice_ready": "The local model selected validated advice from the supplied evidence and options.",
     "model_unavailable": "Local model advice is unavailable; deterministic rule information is shown.",
-    "model_timeout": "Local model advice timed out; deterministic rule information is shown.",
-    "model_busy": "The local model is busy; deterministic rule information is shown.",
+    "model_timeout": "The local model did not return advice within the request budget. Showing deterministic rule information.",
+    "model_busy": "The local model is busy. Showing deterministic rule information. You can request advice again later.",
     "model_rejected": "The model response failed validation; deterministic rule information is shown.",
     "model_error": "Local model advice failed; deterministic rule information is shown.",
     "unsupported": "This finding has no supported model context; deterministic rule information is shown.",

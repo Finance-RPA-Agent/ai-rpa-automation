@@ -85,7 +85,8 @@ class OllamaProvider:
             installed = any(row.get("name") == MODEL and not row.get("remote_host") for row in models)
             return {"available": True, "installed": installed, "model": MODEL,
                     "context_tokens": 4096, "parallel_tasks": 1,
-                    "message": "Ready for local inference." if installed else f"Run: ollama pull {MODEL}"}
+                    "message": ("Model installed. This check does not run inference or confirm the model is loaded. "
+                                "The first request may take longer.") if installed else f"Model not installed. Run: ollama pull {MODEL}"}
         except (httpx.HTTPError, ValueError, TypeError):
             return {"available": False, "installed": False, "model": MODEL,
                     "context_tokens": 4096, "parallel_tasks": 1,

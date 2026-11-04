@@ -43,18 +43,33 @@
         task.id !== value.taskId || task.status !== "waiting_confirmation" ||
         !Number.isSafeInteger(task.id) || task.id < 1 || !Number.isSafeInteger(task.revision) || task.revision < 1 ||
         !/^[a-f0-9]{64}$/.test(task.evidence_digest || "") || !Array.isArray(task.issues)) return null;
-    return { session: value.session, username: value.session.username, token: value.token, hash: value.hash,
+    return { session: value.session, username: value.session.username, sessionEpoch: value.sessionEpoch, token: value.token, hash: value.hash,
       task, taskId: task.id, revision: task.revision, digest: task.evidence_digest };
   }
   function same(a, b) {
-    return Boolean(a && b && ["session", "username", "token", "hash", "task", "taskId", "revision", "digest"].every(key => a[key] === b[key]));
+    return Boolean(a && b && ["session", "username", "sessionEpoch", "token", "hash", "task", "taskId", "revision", "digest"].every(key => a[key] === b[key]));
   }
-  function create({ getContext, request, changed = () => {}, schedule = setTimeout, unschedule = clearTimeout, timeoutMs = 60000 }) {
+  function create({ getContext, request, refreshTask, changed = () => {}, schedule = setTimeout, unschedule = clearTimeout, timeoutMs = 60000 }) {
     let active = null, generation = 0;
     const states = new Map();
+    // A local re-render or selection change cannot unlock a timed-out task snapshot.
+    // The app replaces the snapshot on a successful task-detail read.
+    const needsRefresh = new WeakMap();
+    function requireRefresh(ctx, id) {
+      if (!needsRefresh.has(ctx.task)) needsRefresh.set(ctx.task, new Set());
+      needsRefresh.get(ctx.task).add(id);
+    }
+    function clearTimers(state) {
+      unschedule(state.timer);
+      unschedule(state.slowTimer);
+      state.timer = state.slowTimer = undefined;
+    }
+    function evidenceOnly(data) {
+      return data?.status === "unsupported" || data?.status === "insufficient_evidence";
+    }
     function invalidate() {
       generation += 1;
-      for (const state of states.values()) { state.abort?.abort(); unschedule(state.timer); }
+      for (const state of states.values()) { clearTimers(state); state.abort?.abort(); }
       states.clear(); active = null;
       changed();
     }
@@ -74,16 +89,26 @@
     }
     async function explain(issueId) {
       const ctx = sync();
-      if (!ctx || !issueExists(ctx, issueId) || states.get(issueId)?.kind === "pending") return;
-      const version = generation, state = { kind: "pending", abort: new AbortController() };
+      const last = states.get(issueId);
+      if (!ctx || !issueExists(ctx, issueId) || needsRefresh.get(ctx.task)?.has(issueId) ||
+          last?.kind === "pending" || evidenceOnly(last?.data)) return;
+      const version = generation, state = { kind: "pending", abort: new AbortController(),
+        data: last?.data?.mode === "rules_only" ? last.data : null };
       states.set(issueId, state);
       const isCurrent = () => current(ctx, issueId, version, state);
       state.timer = schedule(() => {
-        if (!isCurrent()) return;
+        if (!isCurrent() || state.kind !== "pending") return;
+        clearTimers(state);
+        requireRefresh(ctx, issueId);
         state.kind = "error";
-        state.message = "This advice request timed out in the page. No correction was made. Refresh before requesting again.";
+        state.message = "This advice request timed out in the page. The local model may still be running. Refresh the task before requesting again.";
         state.abort.abort(); changed();
       }, timeoutMs);
+      state.slowTimer = schedule(() => {
+        if (!isCurrent() || state.kind !== "pending") return;
+        state.slow = true;
+        changed();
+      }, 10000);
       changed();
       try {
         const response = await request(`/tasks/${ctx.taskId}/issues/${encodeURIComponent(issueId)}/explanation`,
@@ -95,6 +120,10 @@
       } catch (error) {
         if (!isCurrent() || state.kind !== "pending") return;
         state.kind = "error";
+        if ([401, 403, 404, 409].includes(error.status)) {
+          state.data = null;
+          requireRefresh(ctx, issueId);
+        }
         state.message = ({
           401: "Your session expired. Sign in again; previous advice has been discarded.",
           403: "You are not permitted to request this advice. No correction was made.",
@@ -102,32 +131,75 @@
           409: "The task evidence has changed. Refresh the task; old advice has been discarded.",
         })[error.status] || (error.message?.startsWith("Advice could not be verified") ? error.message :
           "Advice could not be retrieved from the local service. No correction was made. You may refresh and try again.");
+        if (error.status === 401) {
+          invalidate();
+          sync();
+          states.set(issueId, state);
+          changed();
+        }
       } finally {
-        unschedule(state.timer);
+        clearTimers(state);
         if (isCurrent()) changed();
+      }
+    }
+    async function refresh(issueId) {
+      const ctx = sync();
+      if (!ctx || !issueExists(ctx, issueId) || !needsRefresh.get(ctx.task)?.has(issueId) ||
+          !refreshTask || states.get(issueId)?.kind === "refreshing") return;
+      const version = generation, state = { kind: "refreshing", data: states.get(issueId)?.data,
+        abort: new AbortController() };
+      const isCurrent = () => current(ctx, issueId, version, state);
+      states.set(issueId, state);
+      changed();
+      try {
+        await refreshTask(ctx.taskId, { signal: state.abort.signal, isCurrent });
+      } catch (error) {
+        if (!isCurrent()) return;
+        state.kind = "error";
+        if ([403, 404, 409].includes(error.status)) state.data = null;
+        state.message = ({
+          403: "Permission to refresh this task was denied.",
+          404: "This task is no longer available. Return to the task list.",
+          409: "The task evidence has changed. Refresh the current task.",
+        })[error.status] || "The task could not be refreshed. Try Refresh task again.";
+        changed();
       }
     }
     function render(issueId) {
       const ctx = sync();
       if (!ctx || !issueExists(ctx, issueId)) return "";
       const state = states.get(issueId), pending = state?.kind === "pending";
+      const locked = needsRefresh.get(ctx.task)?.has(issueId);
+      const refreshing = state?.kind === "refreshing";
+      const verify = evidenceOnly(state?.data);
       let body = '<p class="detail-text">Request advice for this finding only. Nothing is sent until you choose Explain / suggest.</p>';
-      if (pending) body = '<p role="status">Requesting local advice… First use can take longer. You can leave this page; no approval is implied.</p>';
+      if (pending) body = state.slow
+        ? '<p role="status">Still waiting for local advice. You can continue manual review or leave this page.</p>'
+        : '<p role="status">Requesting local advice… First use can take longer. You can leave this page; no approval is implied.</p>';
+      if (locked && !state) body = '<p>Refresh the task before requesting advice again.</p>';
+      if (refreshing) body = '<p role="status">Refreshing task evidence…</p>';
       if (state?.kind === "error") body = `<p class="error-text" role="alert">${escape(state.message)}</p>`;
-      if (state?.kind === "ready") {
+      if (state?.data) {
+        body = state.kind === "ready" ? "" : body + '<p>Previous rule result for this finding.</p>';
         const d = state.data, local = d.mode === "local_model";
-        body = `<h4 class="advice-provenance ${local ? "advice-local" : "advice-rules"}">${local ? "Local AI · validated evidence selection" : "Rule-based only · deterministic fallback"}</h4>
+        body += `<h4 class="advice-provenance ${local ? "advice-local" : "advice-rules"}">${local ? "Local AI · validated evidence selection" : "Rule-based only · deterministic fallback"}</h4>
           <p>${escape(d.status_message)} <span class="mono">(${escape(d.status)})</span></p>
           <dl class="advice-facts">${d.facts.map(f => `<div><dt>${escape(f.label)} <span class="muted">${escape({ input: "Source input", reference: "Imported BI reference", rule: "Deterministic rule" }[f.source])}</span></dt><dd>${escape(f.value)}</dd></div>`).join("")}</dl>
           <p>${escape(d.explanation)}</p><h4>Suggested checks — independently verify first</h4>
           <ul>${d.suggestions.map(s => `<li>${escape(s.text)} <strong>Human decision required.</strong></li>`).join("")}</ul>
           <p class="detail-text">Revision ${escape(d.revision)} · Finding ${escape(d.issue_id)} · Evidence <code class="advice-digest">${escape(d.evidence_digest)}</code></p>`;
       }
-      return `<section class="issue-advice" aria-label="Advice for this finding"><button type="button" class="btn secondary" data-action="issue-advice" data-issue-id="${escape(issueId)}" ${pending ? "disabled" : ""}>${pending ? "Requesting advice…" : state?.kind === "ready" ? "Request advice again" : "Explain / suggest"}</button>
+      let label = "Explain / suggest";
+      if (pending) label = "Requesting advice…";
+      else if (verify) label = "Verify source evidence";
+      else if (state) label = "Request advice again";
+      if (verify) body += '<p>Verify the source records and reimport a corrected version if needed.</p>';
+      return `<section class="issue-advice" aria-label="Advice for this finding"><button type="button" class="btn secondary" data-action="issue-advice" data-issue-id="${escape(issueId)}" ${pending || locked || verify ? "disabled" : ""}>${label}</button>
+        ${locked && refreshTask ? `<button type="button" class="btn secondary" data-action="refresh-advice-task" data-issue-id="${escape(issueId)}" ${refreshing ? "disabled" : ""}>Refresh task</button>` : ""}
         <div class="advice-result" aria-live="polite" aria-atomic="true" aria-busy="${pending}">${body}</div>
         <p class="advice-boundary">Advice only. The cause is not established. No values are changed or approved. Use the separate Review correction controls after independent verification.</p></section>`;
     }
-    return { explain, render, sync, invalidate };
+    return { explain, refresh, render, sync, invalidate };
   }
   const exported = { create, validate };
   if (typeof module !== "undefined" && module.exports) module.exports = exported;
