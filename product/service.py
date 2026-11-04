@@ -4,6 +4,7 @@ Each job has its own financial database and immutable reference snapshot. This
 prevents one BI import from changing another job's evidence or archive receipts.
 """
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from dataclasses import asdict
 from decimal import Decimal, InvalidOperation
 from functools import wraps
@@ -12,6 +13,7 @@ import copy
 import csv
 import hashlib
 import json
+import os
 import secrets
 import sqlite3
 import threading
@@ -129,10 +131,53 @@ class ProductService:
             raise HTTPException(422, "Choose a nonempty file of at most 10 MB.")
         file_id = secrets.token_hex(16)
         folder = self.store.root / "files" / file_id
+        if folder.parent.resolve() != folder.parent:
+            raise HTTPException(503, "Upload storage is unavailable.")
         folder.mkdir()
         raw = folder / ("original" + suffix)
-        raw.write_bytes(content)
-        if suffix == ".csv":
+        try:
+            created = folder.stat()
+        except OSError as exc:
+            raise HTTPException(503, "Upload failed and cleanup could not be confirmed.") from exc
+
+        db = None
+        try:
+            raw.write_bytes(content)
+            table = self._read_upload_table(raw)
+            mapping = {field: field for field in FIELDS if field in table["columns"]}
+            relative = str(raw.relative_to(self.store.root))
+            checksum = digest(raw)
+            with self.store.connect() as db:
+                db.execute("INSERT INTO files VALUES(?,?,?,?,?,?,?,?,?,?,?)", (
+                    file_id, Path(name).name, role, relative, relative, checksum, checksum,
+                    encode(table["columns"]), encode(mapping), table["row_count"], timestamp(),
+                ))
+        except Exception:
+            if db is not None:
+                try:
+                    # close() is idempotent. An unfinished writer must not commit after our lookup.
+                    db.close()
+                    registered = self.store.one("SELECT id FROM files WHERE id=?", (file_id,))
+                except Exception as exc:
+                    raise HTTPException(503, "Upload registration could not be confirmed. The original was retained.") from exc
+                if registered:
+                    raise
+            self._discard_upload(raw, created)
+            raise
+        return self.file_view(file_id)
+
+    @staticmethod
+    def _discard_upload(raw, created):
+        try:
+            if raw.resolve() != raw or not os.path.samestat(created, raw.parent.stat()):
+                raise OSError("Upload location changed during processing.")
+            raw.unlink(missing_ok=True)
+            raw.parent.rmdir()
+        except (OSError, RuntimeError) as exc:
+            raise HTTPException(503, "Upload failed and cleanup could not be confirmed.") from exc
+
+    def _read_upload_table(self, raw):
+        if raw.suffix == ".csv":
             try:
                 with raw.open(encoding="utf-8-sig", newline="") as handle:
                     count = 0
@@ -146,7 +191,7 @@ class ProductService:
                             raise ValueError(f"Files may contain at most {MAX_ROWS:,} data rows.")
             except (UnicodeDecodeError, csv.Error) as exc:
                 raise ValueError("The CSV must use UTF-8 encoding and correctly closed quoted fields.") from exc
-        if suffix == ".xlsx":
+        if raw.suffix == ".xlsx":
             try:
                 with zipfile.ZipFile(raw) as archive:
                     if sum(entry.file_size for entry in archive.infolist()) > 100 * 1024 * 1024:
@@ -154,31 +199,24 @@ class ProductService:
             except zipfile.BadZipFile as exc:
                 raise ValueError("This is not a valid .xlsx workbook.") from exc
             from openpyxl import load_workbook
-            try:
-                workbook = load_workbook(raw, read_only=True, data_only=True)
-            except Exception as exc:
-                raise ValueError("The Excel workbook could not be opened. Check that it is a valid, unencrypted .xlsx file.") from exc
-            try:
+            with ExitStack() as files:
+                try:
+                    handle = files.enter_context(raw.open("rb"))
+                    workbook = load_workbook(handle, read_only=True, data_only=True)
+                except Exception as exc:
+                    raise ValueError("The Excel workbook could not be opened. Check that it is a valid, unencrypted .xlsx file.") from exc
+                files.callback(workbook.close)
                 if not workbook.worksheets:
                     raise ValueError("The Excel workbook has no readable worksheets.")
                 sheet = workbook.worksheets[0]
                 if (sheet.max_row and sheet.max_row > MAX_ROWS + 1) or (sheet.max_column and sheet.max_column > 200):
                     raise ValueError(f"The first worksheet must fit within {MAX_ROWS:,} data rows and 200 columns.")
-            finally:
-                workbook.close()
         table = result(read_data_file(str(raw), settings=self.settings))
         if not 0 < table["row_count"] <= MAX_ROWS:
             raise ValueError(f"Files must contain 1–{MAX_ROWS:,} data rows.")
         if table["column_issues"]:
             raise ValueError("Headers are empty or duplicated. Correct the column names before importing.")
-        mapping = {field: field for field in FIELDS if field in table["columns"]}
-        canonical = raw
-        with self.store.connect() as db:
-            db.execute("INSERT INTO files VALUES(?,?,?,?,?,?,?,?,?,?,?)", (
-                file_id, Path(name).name, role, str(raw.relative_to(self.store.root)), str(canonical.relative_to(self.store.root)),
-                digest(raw), digest(canonical), encode(table["columns"]), encode(mapping), table["row_count"], timestamp(),
-            ))
-        return self.file_view(file_id)
+        return table
 
     def file_view(self, file_id, *, preview=True):
         row = self.file(file_id)
