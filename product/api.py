@@ -97,6 +97,11 @@ class Review(Input):
     reason: str = Field(default="", max_length=1500)
 
 
+class IssueExplanation(Input):
+    revision: int = Field(ge=1)
+    evidence_digest: str = Field(pattern="^[0-9a-f]{64}$", min_length=64, max_length=64)
+
+
 class PasswordChange(Input):
     current_password: str = Field(min_length=1, max_length=256)
     new_password: str = Field(min_length=6, max_length=256)
@@ -378,6 +383,10 @@ def create_app(directory=None, *, model=None):
     def run(job_id: int, actor=Depends(account)):
         return service.schedule(job_id, "run", actor)
 
+    @app.post("/api/tasks/{job_id}/issues/{issue_id}/explanation")
+    def explain_issue(job_id: int, issue_id: str, body: IssueExplanation, _actor=Depends(account)):
+        return service.explain_issue(job_id, issue_id, body.revision, body.evidence_digest)
+
     @app.post("/api/tasks/{job_id}/review")
     def review(job_id: int, body: Review, actor=Depends(account)):
         return service.review(job_id, body.revision, body.evidence_digest, [item.model_dump() for item in body.changes], body.reason, actor)
@@ -405,6 +414,7 @@ def create_app(directory=None, *, model=None):
 
     @app.get("/api/archive")
     def archive(_actor=Depends(account)):
+        service.check_archive_recovery()
         return {"records": [dict(row, data=json.loads(row["payload_json"])) for row in service.store.all("SELECT * FROM archive ORDER BY created_at DESC")]}
 
     @app.get("/api/model")

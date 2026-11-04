@@ -120,6 +120,7 @@ const S = {
   route: "dashboard",
   id: null,
   token: 0,
+  sessionEpoch: 0,
   selected: new Set(),
   tab: "records",
   search: "",
@@ -143,10 +144,16 @@ function toast(message, error = false) {
   toastTimer = setTimeout(() => (element.className = ""), 5000);
 }
 async function api(path, options = {}) {
+  // R3B response ownership and PR #3 login lifetime must both remain valid.
+  const { isCurrent, ...requestOptions } = options;
+  const checkCurrent = () => {
+    if (isCurrent && !isCurrent()) throw Object.assign(new Error("Discarded stale advice response."), { name: "AbortError" });
+  };
+  const requestSession = S.sessionEpoch;
   let response;
   try {
     response = await fetch("/api" + path, {
-      ...options,
+      ...requestOptions,
       headers: {
         "X-Requested-With": "FinanceFlow",
         ...(options.body instanceof FormData
@@ -158,9 +165,14 @@ async function api(path, options = {}) {
   } catch {
     throw new Error("The local service is unavailable. Restart Finance Flow.");
   }
+  checkCurrent();
   if (response.status === 401 && path !== "/login" && path !== "/setup") {
-    S.session = { setup_required: false, username: null };
-    render();
+    if (requestSession === S.sessionEpoch) {
+      S.sessionEpoch += 1;
+      if (typeof clearAssistantMemory === "function") clearAssistantMemory();
+      S.session = { setup_required: false, username: null };
+      render();
+    }
     throw new Error("Your session has expired. Please sign in again.");
   }
   let data;
@@ -169,18 +181,65 @@ async function api(path, options = {}) {
   } catch {
     throw new Error("The service returned an unreadable response.");
   }
+  checkCurrent();
   if (!response.ok) {
     const detail = data.detail;
-    throw new Error(
+    throw Object.assign(new Error(
       Array.isArray(detail)
         ? detail.map((d) => d.msg).join(" ")
         : detail || "The operation could not be completed.",
-    );
+    ), { status: response.status });
   }
   return data;
 }
 const post = (path, body = {}) =>
   api(path, { method: "POST", body: JSON.stringify(body) });
+// R3B owns only advice state; navigation/session/review implementations stay separate.
+const issueAdvice = window.FinanceIssueAdvice?.create({
+  getContext: () => ({ session: S.session, sessionEpoch: S.sessionEpoch, token: S.token, hash: location.hash,
+    route: S.route, view: S.tab, task: S.task, taskId: S.id }),
+  request: (path, body, guard) => api(path, { method: "POST", body: JSON.stringify(body), ...guard }),
+  refreshTask: async (id, guard) => {
+    const detail = await api(taskDetailPath(id), guard);
+    if (!guard.isCurrent()) return;
+    if (detail?.id !== id || !Number.isSafeInteger(detail.revision) || !Array.isArray(detail.issues) ||
+        !Array.isArray(detail.decisions)) throw new Error("Invalid task detail.");
+    const previous = S.task, selection = S.selected;
+    S.task = detail;
+    S.selected = new Set();
+    try {
+      render();
+    } catch {
+      // Keep the original refresh gate if the returned detail cannot be displayed.
+      S.task = previous;
+      S.selected = selection;
+      render();
+      toast("The task could not be refreshed. Try Refresh task again.", true);
+    }
+  },
+  changed: () => document.querySelectorAll("[data-issue-advice]").forEach(node => {
+    const focused = node.contains(document.activeElement);
+    node.innerHTML = issueAdvice.render(node.dataset.issueAdvice);
+    if (focused) node.querySelector("button:not(:disabled)")?.focus();
+  }),
+}) || {
+  // A missing optional asset must not break navigation or permit unverified advice.
+  sync() {}, invalidate() {},
+  render: () => '<p class="error-text" role="alert">Advice is unavailable because its page component did not load. Reload the page. No correction was made.</p>',
+  explain: () => toast("Advice is unavailable. Reload the page before requesting it.", true),
+};
+window.addEventListener("hashchange", () => issueAdvice.invalidate());
+window.addEventListener("pagehide", () => issueAdvice.invalidate());
+document.addEventListener("click", event => {
+  const action = event.target.closest("[data-action]")?.dataset.action;
+  if (event.target.closest('a[href^="#"]') || ["logout", "tab", "correct", "correct-selected", "confirm-cancel", "run", "plan"].includes(action)) issueAdvice.invalidate();
+}, true);
+document.addEventListener("submit", event => {
+  if (["review-form", "auth-form", "password-form"].includes(event.target.id)) issueAdvice.invalidate();
+}, true);
+document.addEventListener("change", event => {
+  if (event.target.matches?.("[data-issue], #select-findings")) issueAdvice.invalidate();
+}, true);
 const go = (route) => {
   if (location.hash === "#" + route) navigate();
   else location.hash = route;
@@ -360,7 +419,7 @@ function records(t) {
   return `<div class="table-wrap"><table><thead><tr><th>Row</th><th>Supplier / Order</th><th>Amount</th><th>Payment</th><th>Finding</th></tr></thead><tbody>${t.records.map((r) => `<tr><td class="mono tiny">${r.original_row ?? r.row}</td><td>${esc(r.data.supplier_name || r.data.supplier_id || "Missing supplier")}<div class="tiny muted mono">${esc(r.data.order_id || "—")}</div></td><td class="mono">${display(r.data.amount, "amount")}</td><td>${esc(r.data.payment_status || "—")}</td><td>${t.issues.some((i) => i.row === r.row) ? badge("waiting_confirmation", "Needs review") : badge(t.status === "completed" ? "completed" : "pending", t.status === "completed" ? "Reconciled" : "Read")}</td></tr>`).join("")}</tbody></table>${!t.records.length ? '<div class="empty"><h3>No records</h3></div>' : ""}</div>${t.truncated_preview ? '<p class="detail-text card-body">Preview: first 100 rows</p>' : ""}`;
 }
 function finding(issue) {
-  return `<article class="issue"><div class="top"><input type="checkbox" data-issue="${issue.id}" aria-label="Select ${esc(issueNames[issue.type] || issue.type)} on row ${issue.row || "header"}" ${S.selected.has(issue.id) ? "checked" : ""} ${issue.can_correct ? "" : "disabled"}><div><h3>${esc(issueNames[issue.type] || issue.type)}</h3><p class="meta">${issue.original_row ? "Source row " + issue.original_row : issue.row ? "Working row " + issue.row : "File-level finding"} · ${esc(issue.supplier_id || "—")} / ${esc(issue.order_id || "—")} · ${esc(fieldNames[issue.field] || "Record")}</p></div></div><div class="comparison"><div class="value"><span>Source</span><strong>${display(issue.original_value, issue.field)}</strong></div>${svg("arrow")}<div class="value reference"><span>BI reference</span><strong>${display(issue.reference_value, issue.field)}</strong></div></div><div class="issue-foot"><span>${issue.type === "amount_mismatch" ? "Difference " + amount(issue.difference) : issue.can_correct ? "Your decision is required" : "Correct the source file and create a new task"}</span>${issue.can_correct ? btn("Review correction", "correct", "ghost", `data-issue-id="${issue.id}"`) : ""}</div><p class="detail-text" style="margin:12px 0 0 24px">${esc(issue.message.replaceAll("in the demo", "under the current reconciliation rules"))}</p></article>`;
+  return `<article class="issue"><div class="top"><input type="checkbox" data-issue="${issue.id}" aria-label="Select ${esc(issueNames[issue.type] || issue.type)} on row ${issue.row || "header"}" ${S.selected.has(issue.id) ? "checked" : ""} ${issue.can_correct ? "" : "disabled"}><div><h3>${esc(issueNames[issue.type] || issue.type)}</h3><p class="meta">${issue.original_row ? "Source row " + issue.original_row : issue.row ? "Working row " + issue.row : "File-level finding"} · ${esc(issue.supplier_id || "—")} / ${esc(issue.order_id || "—")} · ${esc(fieldNames[issue.field] || "Record")}</p></div></div><div class="comparison"><div class="value"><span>Source</span><strong>${display(issue.original_value, issue.field)}</strong></div>${svg("arrow")}<div class="value reference"><span>BI reference</span><strong>${display(issue.reference_value, issue.field)}</strong></div></div><div class="issue-foot"><span>${issue.type === "amount_mismatch" ? "Difference " + amount(issue.difference) : issue.can_correct ? "Your decision is required" : "Correct the source file and create a new task"}</span>${issue.can_correct ? btn("Review correction", "correct", "ghost", `data-issue-id="${issue.id}"`) : ""}</div><p class="detail-text" style="margin:12px 0 0 24px">${esc(issue.message.replaceAll("in the demo", "under the current reconciliation rules"))}</p><div data-issue-advice="${esc(issue.id)}">${issueAdvice.render(issue.id)}</div></article>`;
 }
 function reviewPanel(t) {
   return `<div class="between" style="margin-bottom:14px"><label class="checkline"><input id="select-findings" type="checkbox" ${t.issues.filter((i) => i.can_correct).length && t.issues.filter((i) => i.can_correct).every((i) => S.selected.has(i.id)) ? "checked" : ""}>Select correctable findings</label>${btn("Review selected corrections", "correct-selected", "primary", S.selected.size ? "" : "disabled")}</div>${t.issues.map(finding).join("")}${t.truncated_issues ? '<p class="detail-text">Preview: first 200 findings</p>' : ""}${!t.issues.length ? '<div class="info">' + svg("check") + "<div>No unresolved findings</div></div>" : ""}${t.decisions.length ? `<section class="card space"><div class="card-head"><h3>Human decision history</h3></div><div class="card-body">${t.decisions.map((d) => `<div class="log"><time>${date(d.created_at)}</time><div><strong>${esc(d.actor)} · Revision ${d.revision}</strong>${d.reason ? `<p>${esc(d.reason)}</p>` : ""}${d.changes.map((c) => `<p>Row ${c.original_row ?? c.source_row} · ${esc(fieldNames[c.field])}: ${display(c.before, c.field)} → ${display(c.after, c.field)}</p>`).join("")}</div></div>`).join("")}</div></section>` : ""}`;
@@ -427,9 +486,12 @@ function archivePage() {
 }
 function settingsPage() {
   const model = S.model || {};
-  return `${heading("Workspace settings", "Local model, data portability and account security.")}<div class="two-col"><div class="stack"><section class="card"><div class="card-head between"><h2>Local AI connection</h2>${badge(model.installed ? "ready" : "pending", model.installed ? "Ready" : "Setup required")}</div><div class="card-body">${[
+  let connection = "Not checked";
+  if (model.available === false) connection = "Service unreachable";
+  if (model.available === true) connection = model.installed ? "Installed" : "Model missing";
+  return `${heading("Workspace settings", "Local model, data portability and account security.")}<div class="two-col"><div class="stack"><section class="card"><div class="card-head between"><h2>Local AI connection</h2>${badge(connection === "Installed" ? "ready" : "pending", connection)}</div><div class="card-body">${[
     ["Provider", "Ollama · loopback only"],
-    ["Model", model.model || "qwen3.5:4b"],
+    ["Model", esc(model.model || "qwen3.5:4b")],
     ["Context window", "8,192 data / 4,096 reconciliation"],
     ["Concurrency", "One active task"],
     ["Cloud inference", "Disabled by application design"],
@@ -440,7 +502,7 @@ function settingsPage() {
     )
     .join(
       "",
-    )}<p class="detail-text space">${esc(model.message || "Checking local service…")}</p><div class="space">${btn(svg("refresh") + " Refresh connection", "refresh-model", "secondary")}</div></div></section><section class="card card-body"><h2>Data backup</h2><div class="space">${btn(svg("download") + " Download backup", "backup", "secondary")}</div></section></div><div class="stack"><section class="card"><div class="card-head"><h2>Change password</h2></div><form class="card-body" id="password-form"><div class="field"><label for="old-password">Current password</label><input id="old-password" class="input" type="password" required autocomplete="current-password"></div><div class="field"><label for="new-password">New password</label><input id="new-password" class="input" type="password" required minlength="6" maxlength="256" autocomplete="new-password"></div><button class="btn secondary" type="submit">Update password</button></form></section></div></div>`;
+    )}<p class="detail-text space">${esc(model.message || "Connection has not been checked yet.")}</p><div class="space">${btn(svg("refresh") + " Refresh connection", "refresh-model", "secondary")}</div></div></section><section class="card card-body"><h2>Data backup</h2><div class="space">${btn(svg("download") + " Download backup", "backup", "secondary")}</div></section></div><div class="stack"><section class="card"><div class="card-head"><h2>Change password</h2></div><form class="card-body" id="password-form"><div class="field"><label for="old-password">Current password</label><input id="old-password" class="input" type="password" required autocomplete="current-password"></div><div class="field"><label for="new-password">New password</label><input id="new-password" class="input" type="password" required minlength="6" maxlength="256" autocomplete="new-password"></div><button class="btn secondary" type="submit">Update password</button></form></section></div></div>`;
 }
 async function refresh() {
   const response = await api("/tasks");
@@ -450,9 +512,11 @@ async function refresh() {
   S.commands = (await api("/commands")).commands;
 }
 async function navigate() {
-  const token = ++S.token;
+  const token = ++S.token, selectionEpoch = A.epoch, sessionEpoch = S.sessionEpoch;
   try {
-    S.session = await api("/session");
+    const session = await api("/session");
+    if (token !== S.token || sessionEpoch !== S.sessionEpoch) return;
+    S.session = session;
     if (!S.session.username) {
       render();
       return;
@@ -478,8 +542,16 @@ async function navigate() {
       ? route
       : "dashboard";
     S.id = /^\d+$/.test(id || "") ? Number(id) : null;
+    if (S.route === "assistant" && !S.id) {
+      const remembered = assistantRememberedChatId();
+      if (remembered) {
+        S.id = remembered;
+        try { history.replaceState(null, "", "#assistant/" + remembered); } catch {}
+      }
+    }
+    if (S.route === "assistant" && S.id) rememberAssistantChat(S.id);
     await refresh();
-    if (token !== S.token) return;
+    if (token !== S.token || sessionEpoch !== S.sessionEpoch) return;
     if (S.route === "task" && S.id) {
       S.task = await api(taskDetailPath(S.id));
       S.selected.clear();
@@ -496,13 +568,14 @@ async function navigate() {
       if (!S.commandBiFolder) S.commandBiFolder = S.biFolderDraft;
     }
     if (S.route === "batch" && S.id) S.batch = await api("/batches/" + S.id);
-    if (S.route === "assistant") await refreshAssistant();
+    if (S.route === "assistant") await refreshAssistant(token, selectionEpoch);
     if (S.route === "archive") S.archive = (await api("/archive")).records;
     if (S.route === "settings") S.model = await api("/model");
-    if (token !== S.token) return;
+    if (token !== S.token || sessionEpoch !== S.sessionEpoch) return;
     render();
     window.scrollTo(0, 0);
   } catch (error) {
+    if (token !== S.token || sessionEpoch !== S.sessionEpoch) return;
     toast(error.message, true);
     if (!S.session?.username) render();
     else
@@ -512,6 +585,7 @@ async function navigate() {
   }
 }
 function render() {
+  issueAdvice.sync();
   if (!S.session?.username) {
     app.innerHTML = auth();
     return;
@@ -583,7 +657,11 @@ document.addEventListener("click", async (event) => {
   if (!target || target.disabled) return;
   const action = target.dataset.action;
   try {
-    if (action.startsWith("assistant-")) {
+    if (action === "issue-advice") {
+      await issueAdvice.explain(target.dataset.issueId);
+    } else if (action === "refresh-advice-task") {
+      await issueAdvice.refresh(target.dataset.issueId);
+    } else if (action.startsWith("assistant-")) {
       await assistantAction(action, target);
     } else if (action.startsWith("command-")) {
       await commandAction(action, target);
@@ -591,6 +669,8 @@ document.addEventListener("click", async (event) => {
       await batchAction(action, target);
     } else if (action === "close-modal") closeModal();
     else if (action === "logout") {
+      S.sessionEpoch += 1;
+      if (typeof clearAssistantMemory === "function") clearAssistantMemory();
       await post("/logout");
       S.session = { setup_required: false, username: null };
       render();
@@ -722,6 +802,7 @@ document.addEventListener("submit", async (event) => {
         username: document.getElementById("username").value.trim(),
         password: document.getElementById("password").value,
       });
+      S.sessionEpoch += 1;
       await navigate();
     } else if (form.id === "task-form") {
       const task = await post("/tasks", S.draft);

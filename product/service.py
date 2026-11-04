@@ -4,6 +4,7 @@ Each job has its own financial database and immutable reference snapshot. This
 prevents one BI import from changing another job's evidence or archive receipts.
 """
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from dataclasses import asdict
 from decimal import Decimal, InvalidOperation
 from functools import wraps
@@ -12,7 +13,9 @@ import copy
 import csv
 import hashlib
 import json
+import os
 import secrets
+import sqlite3
 import threading
 import zipfile
 
@@ -22,9 +25,10 @@ from sqlalchemy.orm import sessionmaker
 
 from backend.app.config import Settings
 from backend.app.database import Base
-from backend.app.models import FinancialRecord, OaReconciliationRecord, Task
+from backend.app.models import FinancialRecord, Task
 from backend.app.services.agent_runtime import AgentRuntime
 from backend.app.tools import read_data_file, validate_data
+from backend.app.tools.oa_submitter import _content_hash, _sanitise_data
 from backend.app.tools.rules import REQUIRED_FIELDS, format_amount, normalise_identifier, parse_amount
 from product.model import OllamaProvider
 from product.storage import Store, digest, encode, timestamp
@@ -84,6 +88,14 @@ class ProductService:
                 db.execute("UPDATE jobs SET status='failed',state_json=?,updated_at=? WHERE id=?", (encode(state), timestamp(), row["id"]))
             db.execute("UPDATE batches SET status='failed',error=?,updated_at=? WHERE status IN ('scanning','running')",
                        ("The application stopped. Captured files and existing receipts were retained. Review before retrying.", timestamp()))
+        self.archive_recovery_errors = {}
+        for saved_job in self.store.all("SELECT id FROM jobs ORDER BY id"):
+            try:
+                self.sync_archive(saved_job["id"])
+            except (OSError, ValueError, KeyError, TypeError, sqlite3.Error, HTTPException) as exc:
+                # Quarantine only this task; no OA calls, status promotion or
+                # overwriting success records is permitted during recovery.
+                self.archive_recovery_errors[saved_job["id"]] = str(exc)
         from product.batch import FolderBatches
         self.batches = FolderBatches(self)
         from product.commands import Commands
@@ -119,10 +131,53 @@ class ProductService:
             raise HTTPException(422, "Choose a nonempty file of at most 10 MB.")
         file_id = secrets.token_hex(16)
         folder = self.store.root / "files" / file_id
+        if folder.parent.resolve() != folder.parent:
+            raise HTTPException(503, "Upload storage is unavailable.")
         folder.mkdir()
         raw = folder / ("original" + suffix)
-        raw.write_bytes(content)
-        if suffix == ".csv":
+        try:
+            created = folder.stat()
+        except OSError as exc:
+            raise HTTPException(503, "Upload failed and cleanup could not be confirmed.") from exc
+
+        db = None
+        try:
+            raw.write_bytes(content)
+            table = self._read_upload_table(raw)
+            mapping = {field: field for field in FIELDS if field in table["columns"]}
+            relative = str(raw.relative_to(self.store.root))
+            checksum = digest(raw)
+            with self.store.connect() as db:
+                db.execute("INSERT INTO files VALUES(?,?,?,?,?,?,?,?,?,?,?)", (
+                    file_id, Path(name).name, role, relative, relative, checksum, checksum,
+                    encode(table["columns"]), encode(mapping), table["row_count"], timestamp(),
+                ))
+        except Exception:
+            if db is not None:
+                try:
+                    # close() is idempotent. An unfinished writer must not commit after our lookup.
+                    db.close()
+                    registered = self.store.one("SELECT id FROM files WHERE id=?", (file_id,))
+                except Exception as exc:
+                    raise HTTPException(503, "Upload registration could not be confirmed. The original was retained.") from exc
+                if registered:
+                    raise
+            self._discard_upload(raw, created)
+            raise
+        return self.file_view(file_id)
+
+    @staticmethod
+    def _discard_upload(raw, created):
+        try:
+            if raw.resolve() != raw or not os.path.samestat(created, raw.parent.stat()):
+                raise OSError("Upload location changed during processing.")
+            raw.unlink(missing_ok=True)
+            raw.parent.rmdir()
+        except (OSError, RuntimeError) as exc:
+            raise HTTPException(503, "Upload failed and cleanup could not be confirmed.") from exc
+
+    def _read_upload_table(self, raw):
+        if raw.suffix == ".csv":
             try:
                 with raw.open(encoding="utf-8-sig", newline="") as handle:
                     count = 0
@@ -136,7 +191,7 @@ class ProductService:
                             raise ValueError(f"Files may contain at most {MAX_ROWS:,} data rows.")
             except (UnicodeDecodeError, csv.Error) as exc:
                 raise ValueError("The CSV must use UTF-8 encoding and correctly closed quoted fields.") from exc
-        if suffix == ".xlsx":
+        if raw.suffix == ".xlsx":
             try:
                 with zipfile.ZipFile(raw) as archive:
                     if sum(entry.file_size for entry in archive.infolist()) > 100 * 1024 * 1024:
@@ -144,31 +199,24 @@ class ProductService:
             except zipfile.BadZipFile as exc:
                 raise ValueError("This is not a valid .xlsx workbook.") from exc
             from openpyxl import load_workbook
-            try:
-                workbook = load_workbook(raw, read_only=True, data_only=True)
-            except Exception as exc:
-                raise ValueError("The Excel workbook could not be opened. Check that it is a valid, unencrypted .xlsx file.") from exc
-            try:
+            with ExitStack() as files:
+                try:
+                    handle = files.enter_context(raw.open("rb"))
+                    workbook = load_workbook(handle, read_only=True, data_only=True)
+                except Exception as exc:
+                    raise ValueError("The Excel workbook could not be opened. Check that it is a valid, unencrypted .xlsx file.") from exc
+                files.callback(workbook.close)
                 if not workbook.worksheets:
                     raise ValueError("The Excel workbook has no readable worksheets.")
                 sheet = workbook.worksheets[0]
                 if (sheet.max_row and sheet.max_row > MAX_ROWS + 1) or (sheet.max_column and sheet.max_column > 200):
                     raise ValueError(f"The first worksheet must fit within {MAX_ROWS:,} data rows and 200 columns.")
-            finally:
-                workbook.close()
         table = result(read_data_file(str(raw), settings=self.settings))
         if not 0 < table["row_count"] <= MAX_ROWS:
             raise ValueError(f"Files must contain 1–{MAX_ROWS:,} data rows.")
         if table["column_issues"]:
             raise ValueError("Headers are empty or duplicated. Correct the column names before importing.")
-        mapping = {field: field for field in FIELDS if field in table["columns"]}
-        canonical = raw
-        with self.store.connect() as db:
-            db.execute("INSERT INTO files VALUES(?,?,?,?,?,?,?,?,?,?,?)", (
-                file_id, Path(name).name, role, str(raw.relative_to(self.store.root)), str(canonical.relative_to(self.store.root)),
-                digest(raw), digest(canonical), encode(table["columns"]), encode(mapping), table["row_count"], timestamp(),
-            ))
-        return self.file_view(file_id)
+        return table
 
     def file_view(self, file_id, *, preview=True):
         row = self.file(file_id)
@@ -233,6 +281,7 @@ class ProductService:
 
     def schedule(self, job_id, operation, actor):
         with self.guard:
+            self.check_archive_recovery(job_id)
             if self.active is not None or self.batch_active is not None or self.assistant_active is not None:
                 raise HTTPException(409, "Another task is using the local worker. Wait for it to finish.")
             job, state = self.get_job(job_id)
@@ -343,8 +392,8 @@ class ProductService:
                                    "operation_id": f"task-{job_id}-revision-{job['revision']}"})
             self.persist_trace(job_id, outcome.trace, db)
             job, state = self.get_job(job_id)
-            state["evidence_digest"] = outcome.confirmation_request.evidence_digest if outcome.confirmation_request else None
             state["issues"] = self.enrich_issues(state["issues"], state["records"], db)
+            state["evidence_digest"] = self.review_evidence(job, state) if outcome.confirmation_request else None
             state["initial_issues"] = max(state["initial_issues"], len(state["issues"]))
             state["error"] = outcome.reason if outcome.error_code else None
             status = outcome.task_status.value
@@ -362,15 +411,99 @@ class ProductService:
             db.close()
             engine.dispose()
 
+    def check_archive_recovery(self, job_id=None):
+        errors = self.archive_recovery_errors
+        affected = sorted(errors) if job_id is None else ([job_id] if job_id in errors else [])
+        if affected:
+            raise HTTPException(409, "Archive recovery conflict; preserved records require inspection. " +
+                                "; ".join(f"Task {item}: {errors[item]}" for item in affected))
+
+    @serialized
+    def sync_archive(self, job_id):
+        job, state = self.get_job(job_id)
+        path = self.store.root / "jobs" / str(job_id) / "financial.sqlite"
+        candidates = []
+        if path.resolve() != path:
+            raise ValueError("The financial database path was redirected.")
+        if path.exists():
+            # Never use job_database(): it creates schema and seeds BI data.
+            local = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
+            local.row_factory = sqlite3.Row
+            try:
+                local.execute("PRAGMA query_only=ON")
+                local.execute("BEGIN")
+                owner = local.execute("SELECT id,description FROM tasks WHERE id=?", (job_id,)).fetchone()
+                if not owner or owner["description"] != job["instruction"]:
+                    raise ValueError("The financial database task identity does not match.")
+                receipts = [dict(row) for row in local.execute("SELECT * FROM oa_reconciliation_records ORDER BY id")]
+            finally:
+                local.close()
+            if receipts:
+                self.load_file(job["source_id"])
+                self.load_file(job["reference_id"])
+                working = self.path(state["working_file"])
+                if digest(working) != state["working_hash"]:
+                    raise ValueError("The receipt's working revision changed.")
+                table = result(read_data_file(str(working), settings=self.settings))
+                expected = {}
+                for record in table["records"]:
+                    payload, _ignored = _sanitise_data("reconciliation_result", dict(record["data"], record_status="matched"))
+                    operation = f"task-{job_id}-revision-{job['revision']}:result:{record['row']}"
+                    expected[operation] = _content_hash(payload)
+                for receipt in receipts:
+                    operation = receipt["operation_id"]
+                    if (receipt["task_id"] != job_id or receipt["record_type"] != "reconciliation_result" or
+                            receipt["review_status"] != "archived" or operation not in expected or
+                            not receipt["record_id"] or not isinstance(receipt["id"], int) or receipt["id"] <= 0):
+                        raise ValueError("A receipt has mismatched task, revision, row or archive identity.")
+                    payload = json.loads(receipt["payload"])
+                    if not isinstance(payload, dict):
+                        raise ValueError("A receipt payload is not a record.")
+                    _cleaned, ignored = _sanitise_data("reconciliation_result", payload)
+                    if (ignored or _content_hash(payload) != receipt["content_hash"] or
+                            receipt["content_hash"] != expected[operation]):
+                        raise ValueError("A receipt payload does not match its immutable working row.")
+                    candidates.append({"id": f"FF-{job_id:05d}-{receipt['id']:05d}", "job_id": job_id,
+                                       "operation_id": operation, "receipt_id": receipt["record_id"],
+                                       "payload_json": receipt["payload"]})
+        for key in ("id", "operation_id", "receipt_id"):
+            if len({item[key] for item in candidates}) != len(candidates):
+                raise ValueError("The financial database contains duplicate receipt identities.")
+        # Validate the complete mirror before inserting anything. An existing
+        # operation with different content must not be hidden by INSERT OR IGNORE.
+        with self.store.connect() as central:
+            central.execute("BEGIN IMMEDIATE")
+            current = central.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if not current or any(current[key] != job[key] for key in ("revision", "source_id", "reference_id", "state_json")):
+                raise ValueError("The task changed during receipt recovery.")
+            expected_ids = {item["id"] for item in candidates}
+            previous = central.execute("SELECT * FROM archive WHERE job_id=?", (job_id,)).fetchall()
+            if any(row["id"] not in expected_ids for row in previous):
+                raise ValueError("A central receipt has no matching durable financial receipt.")
+            missing = []
+            for candidate in candidates:
+                matches = central.execute("SELECT * FROM archive WHERE id=? OR operation_id=?",
+                                          (candidate["id"], candidate["operation_id"])).fetchall()
+                if matches:
+                    if len(matches) != 1 or any(matches[0][key] != candidate[key] for key in candidate):
+                        raise ValueError("An existing archive operation conflicts with its durable receipt.")
+                else:
+                    missing.append(candidate)
+            for candidate in missing:
+                central.execute("INSERT INTO archive VALUES(?,?,?,?,?,?)", (
+                    candidate["id"], job_id, candidate["operation_id"], candidate["receipt_id"], candidate["payload_json"], timestamp()))
+            if state["archive_count"] != len(candidates):
+                state["archive_count"] = len(candidates)
+                central.execute("UPDATE jobs SET state_json=?,updated_at=? WHERE id=?", (encode(state), timestamp(), job_id))
+
     def persist_trace(self, job_id, trace, db):
+        try:
+            self.sync_archive(job_id)
+        except (OSError, ValueError, KeyError, TypeError, sqlite3.Error, HTTPException) as exc:
+            self.archive_recovery_errors[job_id] = str(exc)
+            raise
         job, state = self.get_job(job_id)
         state["trace"] = [asdict(attempt) for attempt in trace]
-        for receipt in db.query(OaReconciliationRecord).order_by(OaReconciliationRecord.id):
-            record_id = f"FF-{job_id:05d}-{receipt.id:05d}"
-            with self.store.connect() as central:
-                central.execute("INSERT OR IGNORE INTO archive VALUES(?,?,?,?,?,?)", (
-                    record_id, job_id, receipt.operation_id, receipt.record_id, receipt.payload, timestamp()))
-        state["archive_count"] = self.store.one("SELECT COUNT(*) AS n FROM archive WHERE job_id=?", (job_id,))["n"]
         self.store.save_job(job, state)
 
     @staticmethod
@@ -393,18 +526,78 @@ class ProductService:
                                  can_correct=bool(allowed and reference is not None)))
         return enriched
 
+    def review_evidence(self, job, state):
+        # Product approval binds the complete displayed finding set to one task
+        # and revision. Runtime digests and legacy file-only digests are not
+        # approval credentials. GET may derive a fresh token without writing.
+        files = []
+        for role in ("source", "reference"):
+            file = self.file(job[role + "_id"])
+            files.append({"role": role, "id": file["id"], "sha256": file["sha256"],
+                          "canonical_sha256": file["canonical_sha256"]})
+        payload = {"domain": "finance-flow-product-review-v2", "task_id": job["id"],
+                   "revision": job["revision"], "files": files,
+                   "working_file": state["working_file"], "working_hash": state["working_hash"],
+                   "issues": state["issues"]}
+        canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False, allow_nan=False,
+                               separators=(",", ":"))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def _explanation_snapshot(self, job_id, issue_id, revision, evidence):
+        self.check_archive_recovery(job_id)
+        job, state = self.get_job(job_id)
+        if (type(revision) is not int or job["status"] != "waiting_confirmation" or revision != job["revision"] or
+                not isinstance(evidence, str) or evidence != self.review_evidence(job, state)):
+            raise HTTPException(409, "Explanation evidence is stale. Refresh the current task.")
+        issues = [issue for issue in state["issues"] if issue.get("id") == issue_id]
+        if not issues:
+            raise HTTPException(404, "The current finding was not found.")
+        if len(issues) != 1:
+            raise HTTPException(409, "Finding identity is ambiguous.")
+        identities = []
+        try:
+            for role in ("source", "reference"):
+                item = self.file(job[role + "_id"])
+                if (digest(self.path(item["raw_path"])) != item["sha256"] or
+                        digest(self.path(item["canonical_path"])) != item["canonical_sha256"]):
+                    raise ValueError("Stored file changed")
+                identities.append(item)
+            if digest(self.path(state["working_file"])) != state["working_hash"]:
+                raise ValueError("Working file changed")
+        except (OSError, ValueError) as exc:
+            raise HTTPException(409, "Stored explanation evidence changed. Refresh the task.") from exc
+        return {"job": job, "files": identities, "issue": copy.deepcopy(issues[0])}
+
+    def explain_issue(self, job_id, issue_id, revision, evidence):
+        from product.issue_explanation import advise
+        with self.guard:
+            before = self._explanation_snapshot(job_id, issue_id, revision, evidence)
+        # Inference owns neither a business lock nor a database transaction.
+        advice = advise(before["issue"], self.model)
+        with self.guard:
+            after = self._explanation_snapshot(job_id, issue_id, revision, evidence)
+            if before != after:
+                raise HTTPException(409, "The task changed during explanation. Discarded stale advice.")
+            return dict(advice, task_id=job_id, revision=revision, issue_id=issue_id, evidence_digest=evidence)
+
     def review(self, job_id, revision, evidence, changes, reason, actor):
         with self.guard:
+            self.check_archive_recovery(job_id)
             if self.active is not None or self.batch_active is not None or self.assistant_active is not None:
                 raise HTTPException(409, "Wait for the active operation to finish.")
             job, state = self.get_job(job_id)
-            if job["status"] != "waiting_confirmation" or revision != job["revision"] or evidence != state["evidence_digest"]:
+            if job["status"] != "waiting_confirmation" or revision != job["revision"]:
                 raise HTTPException(409, "This review is stale. Refresh the current task evidence.")
-            self.load_file(job["source_id"])
-            self.load_file(job["reference_id"])
-            working = self.path(state["working_file"])
-            if digest(working) != state["working_hash"]:
-                raise HTTPException(409, "The working file changed. Review cannot proceed.")
+            try:
+                self.load_file(job["source_id"])
+                self.load_file(job["reference_id"])
+                working = self.path(state["working_file"])
+                if digest(working) != state["working_hash"]:
+                    raise ValueError("The working file changed.")
+            except (OSError, ValueError) as exc:
+                raise HTTPException(409, "Stored review evidence changed. Review cannot proceed.") from exc
+            if evidence != self.review_evidence(job, state):
+                raise HTTPException(409, "This review is stale. Refresh the current task evidence.")
             if not changes:
                 raise HTTPException(422, "Select at least one correction.")
             current = {issue["id"]: issue for issue in state["issues"]}
@@ -436,8 +629,9 @@ class ProductService:
                 db.close()
                 engine.dispose()
             state.update(working_file=str(target.relative_to(self.store.root)), working_hash=digest(target),
-                         records=table["records"], issues=new_issues, evidence_digest=digest(target),
+                         records=table["records"], issues=new_issues,
                          stage="Corrections saved; ready to resume" if not new_issues else "Further review required")
+            state["evidence_digest"] = self.review_evidence(dict(job, revision=new_revision), state)
             with self.store.connect() as db:
                 db.execute("INSERT INTO decisions(job_id,revision,evidence_digest,actor,changes_json,reason,created_at) VALUES(?,?,?,?,?,?,?)",
                            (job_id, revision, evidence, actor, encode(audit), reason.strip(), timestamp()))
@@ -448,6 +642,7 @@ class ProductService:
 
     def cancel(self, job_id, actor):
         with self.guard:
+            self.check_archive_recovery(job_id)
             if self.batch_active is not None or self.assistant_active is not None:
                 raise HTTPException(409, "Use the folder batch cancellation control while a batch is active.")
             job, state = self.get_job(job_id)
@@ -459,11 +654,13 @@ class ProductService:
                 self.store.save_job(job, state)
                 self.store.event(job_id, "Cancellation requested", "Execution will stop at the next safe tool boundary.", details={"actor": actor})
             else:
+                state.update(stage="Cancelled", cancel_requested=False)
                 self.store.save_job(job, state, "cancelled")
                 self.store.event(job_id, "Task cancelled", "Existing audit and archive records were retained.", "cancelled", {"actor": actor})
         return self.detail(job_id)
 
     def detail(self, job_id, *, full=False, batch_id=None):
+        self.check_archive_recovery(job_id)
         job, state = self.get_job(job_id)
         source, reference = self.file(job["source_id"]), self.file(job["reference_id"])
         total = Decimal("0")
@@ -477,7 +674,8 @@ class ProductService:
                        row_count=len(state["records"]), issue_count=len(state["issues"]), amount=format_amount(total),
                        archive_count=state["archive_count"], stage=state["stage"], error=state["error"],
                        plan=state["plan"], plan_status=state["plan_status"], ai=state["ai"],
-                       cancel_requested=state["cancel_requested"], evidence_digest=state["evidence_digest"],
+                       cancel_requested=state["cancel_requested"],
+                       evidence_digest=self.review_evidence(job, state) if job["status"] == "waiting_confirmation" else state["evidence_digest"],
                        source_sha256=source["sha256"], reference_sha256=reference["sha256"])
         if full:
             summary.update(records=state["records"], issues=state["issues"], trace=state["trace"])

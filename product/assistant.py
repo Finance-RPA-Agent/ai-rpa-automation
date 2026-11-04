@@ -17,6 +17,7 @@ from product.model import ModelUnavailable
 from product.review_workflow import review_requested, run_review, review_summary, review_message
 from product.input_folders import select_inputs, input_files
 from product.storage import digest, encode, timestamp
+from product.request_constraints import CountClarification, CountGuard, parse_count_request
 
 
 class Action(BaseModel):
@@ -213,17 +214,32 @@ class DataAssistant:
             if review_requested(instruction):
                 status = run_review(self, chat_id, turn_id, state, turn)
                 return
+            count_guard = None
+            try:
+                constraint = parse_count_request(instruction)
+                if constraint:
+                    count_guard = CountGuard(tools, turn, instruction, constraint)
+                    self.persist(chat_id, turn_id, state, turn, "running")
+            except CountClarification as exc:
+                turn["message"] = str(exc)
+                turn["constraint_error"] = str(exc)
+                status = "needs_input"
+                return
             history = self.store.all("SELECT instruction,state_json FROM data_turns WHERE chat_id=? AND id<? ORDER BY id DESC LIMIT 4", (chat_id, turn_id))
             plan_schema = Plan.model_json_schema()
             plan_schema["properties"]["required_tools"]["items"] = {"type": "string", "enum": list(SPECS)}
             plan = Plan.model_validate(self.service.model.data_plan({"request": instruction,
                 "latest_frame": state["latest_frame"], "frames": [{"id": key, "columns": info["columns"][:25]} for key, info in list(state["frames"].items())[-5:]],
                 "files": tools.list_files()["files"][:30],
-                "previous_request": history[0]["instruction"][:600] if history else None}, plan_schema))
+                "previous_request": history[0]["instruction"][:600] if history else None,
+                "request_constraint": count_guard.context() if count_guard else None}, plan_schema))
             if any(tool not in SPECS for tool in plan.required_tools): raise ValueError("The model proposed an unsupported capability. Clarify the request.")
             if turn.get("retry_of"):
                 plan.required_tools = list(dict.fromkeys(turn.get("required_tools", []) + plan.required_tools))
             turn["required_tools"] = plan.required_tools
+            if count_guard:
+                plan.required_tools = list(dict.fromkeys(plan.required_tools + ["aggregate", "export_report"]))
+                turn["required_tools"] = plan.required_tools
             row_limit = explicit_row_limit(instruction)
             if row_limit is not None:
                 if not 1 <= row_limit <= 5000: raise ValueError("Choose a row limit between 1 and 5,000.")
@@ -250,12 +266,15 @@ class DataAssistant:
                 context["required_row_limit"] = row_limit
                 context["actions_remaining"] = action_budget - action_index
                 context["difference_chart_required"] = wants_difference_chart(instruction)
+                if count_guard: context["request_constraint"] = count_guard.context()
                 context["_frame_catalog"] = [{"id": key, "columns": info["columns"], "rows": info["rows"], "difference_columns": info.get("difference_columns", [])} for key, info in state["frames"].items()]
                 action = Action.model_validate(self.service.model.data_action(context, Action.model_json_schema()))
                 if self.service.cancel_signal.is_set(): status = "cancelled"; break
                 if action.action in ("final", "ask"):
                     if action.tool is not None or action.arguments: raise ValueError("A final response cannot include a tool call.")
                     missing = context["remaining_required_tools"]
+                    count_error = count_guard.completion_error() if count_guard and action.action == "final" else None
+                    if count_error: missing = list(dict.fromkeys(missing + ["verified_count_export"]))
                     if row_limit is not None:
                         latest = state["frames"].get(state["latest_frame"], {})
                         if latest.get("rows", row_limit + 1) > row_limit: missing = list(dict.fromkeys(missing + ["limit_rows"]))
@@ -270,7 +289,7 @@ class DataAssistant:
                     if action.action == "final" and (missing or turn["steps"] and turn["steps"][-1]["status"] == "error"):
                         failures += 1
                         total_failures += 1
-                        turn["steps"].append({"tool": "completion_check", "arguments": {}, "status": "error", "error": "The task is not complete. Still required: " + ", ".join(missing) + ". Correct the last error and call the remaining tools. A written claim is not execution."})
+                        turn["steps"].append({"tool": "completion_check", "arguments": {}, "status": "error", "error": "The task is not complete. Still required: " + ", ".join(missing) + ". Correct the last error and call the remaining tools. A written claim is not execution." + (" " + count_error if count_error else "")})
                         self.persist(chat_id, turn_id, state, turn, "running")
                         if failures >= 3 or total_failures >= 8: raise ValueError("The requested outputs were not produced. Retained results and tool errors are available; continue with a smaller request.")
                         continue
@@ -298,8 +317,12 @@ class DataAssistant:
                             turn["message"] = re.sub(re.escape(symbol) + r"(?=\s*\d)", "", turn["message"])
                     question = message.endswith("?") or re.search(r"\b(please confirm|need your confirmation|shall I proceed|may I inspect)\b", message, re.I)
                     status = "needs_input" if action.action == "ask" or question else "completed"
+                    if count_guard and status == "completed":
+                        turn["model_message"] = message
+                        turn["message"] = count_guard.message()
                     break
                 try:
+                    if count_guard: count_guard.before(action.tool, action.arguments)
                     if action.tool == "limit_rows" and row_limit is not None and "sort_rows" in plan.required_tools:
                         sorted_frames = {step["result"]["frame_id"] for step in turn["steps"] if step["tool"] == "sort_rows" and step["status"] == "success"}
                         if action.arguments.get("frame_id") not in sorted_frames:
@@ -309,6 +332,7 @@ class DataAssistant:
                         if action.arguments.get("y") not in info.get("difference_columns", []):
                             raise ValueError("The requested chart must plot a computed amount difference, not order counts. Aggregate the detail difference with op=sum into the summary or subtract the two summary amount totals, then plot that difference column.")
                     result = tools.call(action.tool, action.arguments)
+                    if count_guard: count_guard.after(action.tool, action.arguments, result)
                     failures = 0
                     # Persist actual tool results, never a model's claimed execution.
                     result_text = encode(result)

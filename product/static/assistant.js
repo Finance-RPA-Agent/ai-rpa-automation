@@ -1,5 +1,81 @@
 "use strict";
-const A = {chat: null, chats: [], draft: "", folder: "", biFolder: "", busy: false, polling: false, error: ""};
+const A = {chat: null, chats: [], draft: "", folder: "", biFolder: "", busy: false, polling: false, error: "", selectedId: null, epoch: 0, operation: 0, detailRead: 0};
+function clearAssistantMemory() {
+  A.chat = null; A.chats = []; A.draft = ""; A.folder = ""; A.biFolder = "";
+  A.busy = false; A.polling = false; A.error = ""; A.selectedId = null;
+  A.epoch += 1; A.operation += 1; A.detailRead += 1;
+}
+function assistantRememberedChatId() {
+  return A.selectedId === null ? null : A.selectedId;
+}
+function rememberAssistantChat(id) {
+  A.selectedId = id;
+}
+function assistantContext() {
+  return {session: S.sessionEpoch, selection: A.epoch, selectedId: A.selectedId, navigation: S.token, hash: location.hash, route: S.route};
+}
+function assistantSessionCurrent(context) {
+  return context.session === S.sessionEpoch;
+}
+function assistantSelectionCurrent(context) {
+  return assistantSessionCurrent(context) && context.selection === A.epoch && context.selectedId === A.selectedId;
+}
+function assistantNavigationCurrent(context) {
+  return context.navigation === S.token && context.hash === location.hash;
+}
+function assistantViewingChat(chatId) {
+  return S.route === "assistant" && S.id === chatId && A.selectedId === chatId;
+}
+function assistantViewSnapshot(chatId) {
+  return {
+    session: S.sessionEpoch, selection: A.epoch, selectedId: A.selectedId,
+    navigation: S.token, hash: location.hash, chatId,
+  };
+}
+function assistantViewCurrent(view) {
+  return assistantSessionCurrent(view) &&
+    view.selection === A.epoch && view.selectedId === A.selectedId &&
+    view.navigation === S.token && view.hash === location.hash &&
+    assistantViewingChat(view.chatId);
+}
+function beginAssistantDetailRead() {
+  return ++A.detailRead;
+}
+function assistantDetailReadCurrent(view, read) {
+  return read === A.detailRead && assistantViewCurrent(view);
+}
+function applyAssistantChat(chat, view, read) {
+  if (!assistantDetailReadCurrent(view, read) || chat.id !== view.chatId) return false;
+  A.chat = chat;
+  A.folder = chat.folder; A.biFolder = chat.bi_folder || "";
+  return true;
+}
+function assistantBeginOperation() {
+  const operation = ++A.operation;
+  A.busy = true; A.error = "";
+  return operation;
+}
+function assistantFinishOperation(operation) {
+  if (operation !== A.operation) return false;
+  A.busy = false;
+  return true;
+}
+async function refreshAssistantChat(chatId, acceptedTurnId) {
+  if (!assistantViewingChat(chatId)) return {status: "obsolete"};
+  const view = assistantViewSnapshot(chatId);
+  const read = beginAssistantDetailRead();
+  let chat;
+  try {
+    chat = await api("/assistant/chats/" + chatId);
+  } catch (error) {
+    if (!assistantDetailReadCurrent(view, read)) return {status: "obsolete"};
+    if (Number.isInteger(acceptedTurnId) && A.chat?.id === chatId) A.chat.active_turn = acceptedTurnId;
+    return {status: "error", error};
+  }
+  if (!applyAssistantChat(chat, view, read)) return {status: "obsolete"};
+  A.error = "";
+  return {status: "applied"};
+}
 const dataToolLabels = {reconcile_review: "Reconcile and review", list_files: "Find tables", inspect_table: "Read table", profile_table: "Check data quality", completion_check: "Check requested outputs", limit_rows: "Select row range", rename_columns: "Rename columns",
   select_columns: "Select columns", filter_rows: "Filter rows", sort_rows: "Sort rows", deduplicate: "Check duplicates",
   fill_missing: "Fill missing values", normalize_text: "Clean text", concatenate: "Append tables", join_tables: "Join tables",
@@ -62,28 +138,80 @@ function assistantChart(chart) {
   return `<svg class="data-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="${esc(chart.title)}"><title>${esc(chart.title)}</title>${shapes}</svg>`;
 }
 
-async function refreshAssistant() {
-  A.chats = (await api("/assistant/chats")).chats;
-  A.chat = S.route === "assistant" && S.id ? await api("/assistant/chats/" + S.id) : null;
-  if (A.chat) { A.folder = A.chat.folder; A.biFolder = A.chat.bi_folder || ""; }
+async function refreshAssistant(token, epoch) {
+  const chats = (await api("/assistant/chats")).chats;
+  if (token !== S.token || epoch !== A.epoch) return;
+  A.chats = chats;
+  const chatId = S.route === "assistant" && S.id ? S.id : null;
+  if (!chatId) { A.chat = null; return; }
+  if (!assistantViewingChat(chatId)) return;
+  const view = assistantViewSnapshot(chatId);
+  const read = beginAssistantDetailRead();
+  let chat;
+  try {
+    chat = await api("/assistant/chats/" + chatId);
+  } catch (error) {
+    if (!assistantDetailReadCurrent(view, read)) return;
+    throw error;
+  }
+  if (!assistantDetailReadCurrent(view, read)) return;
+  if (A.chat?.id !== chat.id) A.error = "";
+  if (applyAssistantChat(chat, view, read)) A.selectedId = chat.id;
 }
 
 async function assistantSubmit() {
   if (A.busy) return;
-  A.busy = true; A.error = ""; render();
+  const instruction = A.draft.trim();
+  const folder = A.folder.trim(), biFolder = A.biFolder.trim() || null;
+  const context = assistantContext();
+  const chat = S.route === "assistant" && A.chat?.id === S.id ? A.chat : null;
+  const operation = assistantBeginOperation();
+  render();
+  let acceptedId = null, created = false;
   try {
-    const instruction = A.draft.trim();
-    let chat = S.route === "assistant" ? A.chat : null;
-    if (!chat) chat = await post("/assistant/chats", {folder: A.folder.trim(), bi_folder: A.biFolder.trim() || null});
-    const response = await post(`/assistant/chats/${chat.id}/turns`, {instruction});
-    A.draft = "";
-    go("assistant/" + response.chat_id);
-  } catch (error) { A.error = error.message; }
-  finally { A.busy = false; render(); }
+    let target = chat;
+    if (!target) {
+      target = await post("/assistant/chats", {folder, bi_folder: biFolder});
+      if (!assistantSessionCurrent(context)) return;
+      acceptedId = target.id; created = true;
+      if (assistantSelectionCurrent(context)) {
+        A.selectedId = acceptedId;
+        context.selectedId = acceptedId;
+      }
+      if (!A.chats.some(item => item.id === target.id))
+        A.chats = [{id: target.id, title: target.title || "Data conversation"}, ...A.chats];
+    } else acceptedId = target.id;
+    const response = await post(`/assistant/chats/${target.id}/turns`, {instruction});
+    if (!assistantSessionCurrent(context)) return;
+    acceptedId = response.chat_id || target.id;
+    if (assistantSelectionCurrent(context)) {
+      A.selectedId = acceptedId;
+      if (A.draft.trim() === instruction) A.draft = "";
+    }
+    if (assistantSessionCurrent(context) && assistantViewingChat(acceptedId)) {
+      const refreshed = await refreshAssistantChat(acceptedId, response.id);
+      if (refreshed.status === "error") toast(refreshed.error.message, true);
+    } else if (assistantSelectionCurrent(context) && assistantNavigationCurrent(context) &&
+      (context.route === "dashboard" || context.route === "assistant")) {
+      go("assistant/" + acceptedId);
+    }
+  } catch (error) {
+    if (assistantSelectionCurrent(context)) {
+      A.error = error.message;
+      if (created && S.id !== acceptedId) A.selectedId = null;
+    }
+  } finally {
+    if (assistantFinishOperation(operation)) {
+      if (S.route === "assistant" || S.route === "dashboard") render();
+    }
+  }
 }
 
 async function assistantAction(action, target) {
-  if (action === "assistant-new") { A.chat = null; A.draft = ""; A.error = ""; go("assistant"); }
+  if (action === "assistant-new") {
+    A.chat = null; A.draft = ""; A.error = ""; A.selectedId = null; A.epoch += 1;
+    go("assistant");
+  }
   else if (action === "assistant-pick" || action === "assistant-pick-bi") {
     target.disabled = true;
     try { const result = await post("/batches/pick-folder"); if (result.folder) { if (action === "assistant-pick-bi") A.biFolder = result.folder; else A.folder = result.folder; render(); } }
@@ -92,12 +220,23 @@ async function assistantAction(action, target) {
     if (A.busy || A.chat?.active_turn) return;
     const turn = A.chat?.turns.find(item => item.id === Number(target.dataset.turn));
     if (!turn) return;
-    A.busy = true; A.error = ""; render();
+    const chatId = A.chat.id, context = assistantContext();
+    const operation = assistantBeginOperation();
+    render();
     try {
-      await post(`/assistant/chats/${A.chat.id}/turns`, {instruction: turn.instruction, retry_turn_id: turn.id});
-      A.chat = await api("/assistant/chats/" + A.chat.id);
-    } catch (error) { A.error = error.message; }
-    finally { A.busy = false; render(); }
+      const response = await post(`/assistant/chats/${chatId}/turns`, {instruction: turn.instruction, retry_turn_id: turn.id});
+      if (!assistantSessionCurrent(context)) return;
+      if (assistantViewingChat(chatId)) {
+        const refreshed = await refreshAssistantChat(chatId, response.id);
+        if (refreshed.status === "error") toast(refreshed.error.message, true);
+      }
+    } catch (error) {
+      if (assistantSelectionCurrent(context) && assistantViewingChat(chatId))
+        A.error = error.message;
+    }
+    finally {
+      if (assistantFinishOperation(operation) && S.route === "assistant") render();
+    }
   } else if (action === "assistant-cancel") {
     await post(`/assistant/turns/${target.dataset.turn}/cancel`); target.disabled = true;
   } else if (action === "assistant-review-export") {
@@ -123,14 +262,22 @@ document.addEventListener("input", event => {
   if (event.target.id === "assistant-bi-folder") A.biFolder = event.target.value;
 });
 document.addEventListener("change", event => {
-  if (event.target.id === "assistant-history" && event.target.value) { A.error = ""; A.draft = ""; go("assistant/" + event.target.value); }
+  if (event.target.id === "assistant-history" && event.target.value) {
+    A.error = ""; A.draft = ""; A.epoch += 1; go("assistant/" + event.target.value);
+  }
 });
 setInterval(async () => {
   if (A.polling || S.route !== "assistant" || !S.session?.username || !A.chat?.active_turn) return;
-  A.polling = true; const chatId = A.chat.id, token = S.token;
+  const chatId = A.chat.id;
+  if (!assistantViewingChat(chatId)) return;
+  A.polling = true;
+  const view = assistantViewSnapshot(chatId);
+  const read = beginAssistantDetailRead();
   try {
     const chat = await api("/assistant/chats/" + chatId);
-    if (S.token === token && S.route === "assistant" && S.id === chatId) { A.chat = chat; render(); }
-  } catch (error) { toast(error.message, true); }
+    if (applyAssistantChat(chat, view, read)) render();
+  } catch (error) {
+    if (assistantDetailReadCurrent(view, read)) toast(error.message, true);
+  }
   finally { A.polling = false; }
 }, 1200);

@@ -1639,3 +1639,20 @@ th { color: #6b6e67; }
 
 .data-review-card { margin-top: 18px; padding-top: 18px; border-top: 1px solid #e5e2df; }
 .data-review-card .stats { margin-bottom: 18px; }
+
+/* R3B read-only advice, separate from human correction controls. */
+.issue-advice { margin: 16px 0 0 24px; padding: 16px; border: 1px solid #d5dce6; border-radius: 10px; background: #f8fafc; }
+.advice-result { margin-top: 12px; overflow-wrap: anywhere; }
+.advice-result h4 { margin: 12px 0 8px; font-size: 14px; }
+.advice-local { color: #2358a5; }
+.advice-rules { color: #805214; }
+.advice-facts { display: grid; gap: 8px; margin: 12px 0; }
+.advice-facts > div { padding: 8px 10px; background: white; border-radius: 6px; }
+.advice-facts dt { font-size: 12px; }
+.advice-facts dt span { display: block; }
+.advice-facts dd { margin: 4px 0 0; font-family: ui-monospace, monospace; white-space: pre-wrap; }
+.advice-result li { margin: 8px 0; }
+.advice-boundary { border-top: 1px solid #d5dce6; padding-top: 10px; margin-bottom: 0; font-size: 12px; line-height: 1.5; color: #46536a; }
+.advice-digest { overflow-wrap: anywhere; font-size: 11px; }
+.issue-advice button:focus-visible { outline: 3px solid #2868c7; outline-offset: 3px; }
+@media (max-width: 640px) { .issue-advice { margin-left: 0; padding: 12px; } }
