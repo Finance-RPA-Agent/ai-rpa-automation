@@ -22,6 +22,7 @@ def expanded_schema(model):
 
 
 def action_schema(context):
+    count = context.get("request_constraint")
     frames = context.get("_frame_catalog", context.get("frames", []))
     ids = [frame["id"] for frame in frames]
     columns = list(dict.fromkeys(column for frame in frames for column in frame["columns"]))
@@ -34,6 +35,7 @@ def action_schema(context):
                                "tool": {"type": "string", "enum": [tool]}, "arguments": arguments,
                                "message": {"type": "string", "enum": [""]}}}
     for tool, (model, _) in SPECS.items():
+        if count and tool not in ("list_files", "inspect_table", "profile_table", "concatenate", "aggregate", "export_report"): continue
         schema = expanded_schema(model)
         properties = schema.get("properties", {})
         if "frame_id" in properties and not ids: continue
@@ -44,6 +46,13 @@ def action_schema(context):
             if key in properties: properties[key]["enum"] = ids
         if "frame_ids" in properties: properties["frame_ids"]["items"]["enum"] = ids
         if "file_id" in properties: properties["file_id"]["enum"] = files
+        if count and tool == "inspect_table":
+            properties["file_id"]["enum"] = count["input_files"]
+            properties["header_row"]["enum"] = [1]
+        if count and tool == "export_report":
+            if not count["verified_result_ids"]: continue
+            properties["frame_ids"].update(minItems=1, maxItems=1)
+            properties["frame_ids"]["items"]["enum"] = count["verified_result_ids"]
         if tool == "create_chart":
             for frame in frames:
                 if not 1 <= frame.get("rows", 1) <= 30: continue
@@ -58,10 +67,17 @@ def action_schema(context):
         if tool == "aggregate":
             # Bind each metrics input to the selected frame. Output aliases stay new names.
             for frame in frames:
+                if count and frame["id"] not in count["aggregate_frame_ids"]: continue
                 args = copy.deepcopy(schema); props = args["properties"]
                 props["frame_id"]["enum"] = [frame["id"]]
                 props["group_by"]["items"]["enum"] = frame["columns"]
                 props["metrics"]["items"]["properties"]["column"]["enum"] = frame["columns"]
+                if count:
+                    props["group_by"].update(minItems=0, maxItems=0)
+                    props["metrics"].update(minItems=1, maxItems=1)
+                    metric = props["metrics"]["items"]["properties"]
+                    for key, value in (("column", count["column"]), ("op", "count"), ("output", count["output"])):
+                        metric[key]["enum"] = [value]
                 args["required"] = ["frame_id", "group_by", "metrics"]
                 variants.append(branch(tool, args))
             continue

@@ -116,10 +116,14 @@ const S = {
   tasks: [],
   files: [],
   task: null,
+  taskPollError: null,
+  startBusy: false,
+  startError: "",
   active: null,
   route: "dashboard",
   id: null,
   token: 0,
+  sessionEpoch: 0,
   selected: new Set(),
   tab: "records",
   search: "",
@@ -131,6 +135,7 @@ const S = {
     source_id: "",
     reference_id: "",
     ai: true,
+    review_plan: false,
   },
 };
 const app = document.getElementById("app");
@@ -143,10 +148,16 @@ function toast(message, error = false) {
   toastTimer = setTimeout(() => (element.className = ""), 5000);
 }
 async function api(path, options = {}) {
+  // R3B response ownership and PR #3 login lifetime must both remain valid.
+  const { isCurrent, ...requestOptions } = options;
+  const checkCurrent = () => {
+    if (isCurrent && !isCurrent()) throw Object.assign(new Error("Discarded stale advice response."), { name: "AbortError" });
+  };
+  const requestSession = S.sessionEpoch;
   let response;
   try {
     response = await fetch("/api" + path, {
-      ...options,
+      ...requestOptions,
       headers: {
         "X-Requested-With": "FinanceFlow",
         ...(options.body instanceof FormData
@@ -158,9 +169,14 @@ async function api(path, options = {}) {
   } catch {
     throw new Error("The local service is unavailable. Restart Finance Flow.");
   }
+  checkCurrent();
   if (response.status === 401 && path !== "/login" && path !== "/setup") {
-    S.session = { setup_required: false, username: null };
-    render();
+    if (requestSession === S.sessionEpoch) {
+      S.sessionEpoch += 1;
+      if (typeof clearAssistantMemory === "function") clearAssistantMemory();
+      S.session = { setup_required: false, username: null, demo_mode: Boolean(S.session?.demo_mode) };
+      render();
+    }
     throw new Error("Your session has expired. Please sign in again.");
   }
   let data;
@@ -169,18 +185,65 @@ async function api(path, options = {}) {
   } catch {
     throw new Error("The service returned an unreadable response.");
   }
+  checkCurrent();
   if (!response.ok) {
     const detail = data.detail;
-    throw new Error(
+    throw Object.assign(new Error(
       Array.isArray(detail)
         ? detail.map((d) => d.msg).join(" ")
         : detail || "The operation could not be completed.",
-    );
+    ), { status: response.status });
   }
   return data;
 }
 const post = (path, body = {}) =>
   api(path, { method: "POST", body: JSON.stringify(body) });
+// R3B owns only advice state; navigation/session/review implementations stay separate.
+const issueAdvice = window.FinanceIssueAdvice?.create({
+  getContext: () => ({ session: S.session, sessionEpoch: S.sessionEpoch, token: S.token, hash: location.hash,
+    route: S.route, view: S.tab, task: S.task, taskId: S.id }),
+  request: (path, body, guard) => api(path, { method: "POST", body: JSON.stringify(body), ...guard }),
+  refreshTask: async (id, guard) => {
+    const detail = await api(taskDetailPath(id), guard);
+    if (!guard.isCurrent()) return;
+    if (detail?.id !== id || !Number.isSafeInteger(detail.revision) || !Array.isArray(detail.issues) ||
+        !Array.isArray(detail.decisions)) throw new Error("Invalid task detail.");
+    const previous = S.task, selection = S.selected;
+    S.task = detail;
+    S.selected = new Set();
+    try {
+      render();
+    } catch {
+      // Keep the original refresh gate if the returned detail cannot be displayed.
+      S.task = previous;
+      S.selected = selection;
+      render();
+      toast("The task could not be refreshed. Try Refresh task again.", true);
+    }
+  },
+  changed: () => document.querySelectorAll("[data-issue-advice]").forEach(node => {
+    const focused = node.contains(document.activeElement);
+    node.innerHTML = issueAdvice.render(node.dataset.issueAdvice);
+    if (focused) node.querySelector("button:not(:disabled)")?.focus();
+  }),
+}) || {
+  // A missing optional asset must not break navigation or permit unverified advice.
+  sync() {}, invalidate() {},
+  render: () => '<p class="error-text" role="alert">Advice is unavailable because its page component did not load. Reload the page. No correction was made.</p>',
+  explain: () => toast("Advice is unavailable. Reload the page before requesting it.", true),
+};
+window.addEventListener("hashchange", () => issueAdvice.invalidate());
+window.addEventListener("pagehide", () => issueAdvice.invalidate());
+document.addEventListener("click", event => {
+  const action = event.target.closest("[data-action]")?.dataset.action;
+  if (event.target.closest('a[href^="#"]') || ["logout", "tab", "correct", "correct-selected", "confirm-cancel", "run", "plan"].includes(action)) issueAdvice.invalidate();
+}, true);
+document.addEventListener("submit", event => {
+  if (["review-form", "auth-form", "password-form"].includes(event.target.id)) issueAdvice.invalidate();
+}, true);
+document.addEventListener("change", event => {
+  if (event.target.matches?.("[data-issue], #select-findings")) issueAdvice.invalidate();
+}, true);
 const go = (route) => {
   if (location.hash === "#" + route) navigate();
   else location.hash = route;
@@ -193,6 +256,7 @@ function heading(title, sub, actions = "") {
   return `<div class="heading between"><div><h1>${title}</h1></div><div class="flex">${actions}</div></div>`;
 }
 function auth() {
+  if (S.session?.demo_mode) return `<div class="auth"><header class="auth-header">${brand()}</header><main class="auth-main"><section class="auth-form" aria-labelledby="auth-title"><h1 id="auth-title">Welcome to Finance Flow</h1><form id="auth-form"><div class="field"><label for="username">Username</label><input id="username" class="input" value="Demo User" readonly autocomplete="off"></div><div class="field"><label for="password">Password</label><input id="password" class="input" type="password" value="demo" readonly autocomplete="off"></div><button class="btn primary" type="submit">Enter demo ${svg("arrow")}</button><p class="error-text" id="auth-error" role="alert"></p></form></section></main></div>`;
   const setup = S.session?.setup_required;
   return `<div class="auth"><header class="auth-header">${brand()}</header><main class="auth-main"><section class="auth-form" aria-labelledby="auth-title"><h1 id="auth-title">${setup ? "Create your workspace" : "Welcome back"}</h1><form id="auth-form"><div class="field"><label for="username">Username</label><input id="username" class="input" required minlength="2" maxlength="64" autocomplete="username" placeholder="e.g. Richard Xu"></div><div class="field"><label for="password">Password</label><input id="password" class="input" type="password" required minlength="${setup ? 6 : 1}" maxlength="256" autocomplete="${setup ? "new-password" : "current-password"}"></div><button class="btn primary" type="submit">${setup ? "Create workspace" : "Sign in"} ${svg("arrow")}</button><p class="error-text" id="auth-error" role="alert"></p></form></section></main></div>`;
 }
@@ -225,7 +289,7 @@ function shell(body) {
       archive: "Local archive",
       settings: "Settings",
     }[S.route] || "Overview";
-  return `<aside class="sidebar">${brand()}<div class="nav-label">Workspace</div><nav class="nav" aria-label="Main navigation">${navigation.map(([key, ico, label]) => `<a href="#${key}" title="${label}" aria-label="${label}" class="${key === active ? "active" : ""}" ${key === active ? 'aria-current="page"' : ""}>${svg(ico)}<span class="text">${label}</span>${key === "tasks" && waiting ? `<span class="count">${waiting}</span>` : ""}</a>`).join("")}</nav><div class="sidebar-bottom"><div class="between"><span class="local-status">${svg("shield")}Local workspace</span><button class="icon-btn" data-action="logout" title="Sign out" aria-label="Sign out">${svg("logout")}</button></div></div></aside><div class="shell"><header class="topbar"><div class="breadcrumbs">Workspace ${svg("chevron")}<span>${pageTitle}</span></div><div class="top-right"><div class="top-user"><div class="avatar">${esc(S.session.username.slice(0, 2).toUpperCase())}</div><span>${esc(S.session.username)}</span></div></div></header><main class="main">${body}</main></div>`;
+  return `<aside class="sidebar">${brand()}<div class="nav-label">Workspace</div><nav class="nav" aria-label="Main navigation">${navigation.map(([key, ico, label]) => `<a href="#${key}" title="${label}" aria-label="${label}" class="${key === active ? "active" : ""}" ${key === active ? 'aria-current="page"' : ""}>${svg(ico)}<span class="text">${label}</span>${key === "tasks" && waiting ? `<span class="count">${waiting}</span>` : ""}</a>`).join("")}</nav><div class="sidebar-bottom"><div class="between"><span class="local-status">${svg("shield")}${S.session.demo_mode ? "Demo workspace" : "Local workspace"}</span><button class="icon-btn" data-action="logout" title="Sign out" aria-label="Sign out">${svg("logout")}</button></div></div></aside><div class="shell"><header class="topbar"><div class="breadcrumbs">Workspace ${svg("chevron")}<span>${pageTitle}</span></div><div class="top-right"><div class="top-user"><div class="avatar">${esc(S.session.username.slice(0, 2).toUpperCase())}</div><span>${esc(S.session.username)}</span></div></div></header><main class="main">${body}</main></div>`;
 }
 function taskTable(tasks) {
   return tasks.length
@@ -343,13 +407,26 @@ function filteredTasks() {
       ),
   );
 }
+async function openReportsFolder() {
+  const result = await post("/reports/open");
+  if (!result.opened) toast("Reports folder: " + result.path);
+}
 function fileSelect(role) {
   const items = S.files.filter((f) => f.role === role);
   return `<select class="input" id="${role}-select" aria-label="${role === "source" ? "Source orders" : "BI reference export"}" required><option value="">Choose ${role === "source" ? "source orders" : "BI reference export"}</option>${items.map((f) => `<option value="${f.id}" ${S.draft[role + "_id"] === f.id ? "selected" : ""}>${esc(f.name)} · ${f.row_count} rows${f.ready ? "" : " · mapping needed"}</option>`).join("")}</select><div class="upload-zone" data-dropzone="${role}">${svg("upload")}<strong>Choose a file or drop it here</strong><input type="file" accept=".xlsx,.csv" data-upload="${role}" aria-label="Upload ${role === "source" ? "source file" : "BI reference export"}"></div>`;
 }
 function newPage() {
-  return `${heading("New reconciliation", "Choose your files, then create a reconciliation task.")}<div class="stack"><section class="card"><div class="card-head"><h2>Task details</h2></div><form id="task-form" class="card-body"><div class="field"><label for="task-title">Task title</label><input id="task-title" class="input" required maxlength="120" value="${esc(S.draft.title)}"></div><div class="two-col"><div class="field"><label for="source-select">Source orders</label>${fileSelect("source")}</div><div class="field"><label for="reference-select">BI reference export</label>${fileSelect("reference")}</div></div><div class="field"><label for="task-instruction">Instructions</label><textarea id="task-instruction" class="input" required minlength="3" maxlength="3000">${esc(S.draft.instruction)}</textarea></div><label class="checkline"><input id="use-ai" type="checkbox" ${S.draft.ai ? "checked" : ""}><span>Use local AI to prepare the execution plan</span></label><div class="divider"></div><div class="between"><a class="tiny accent" href="/api/template">${svg("download")}Download field template</a><button type="submit" class="btn primary">Create task ${svg("arrow")}</button></div></form></section></div>`;
+  const advanced = S.draft.review_plan;
+  return `${heading("New reconciliation", "")}<section class="card"><div class="card-head"><h2>Choose files to reconcile</h2></div><form id="task-form" class="card-body"><div class="two-col"><div class="field"><label for="source-select">Source orders</label>${fileSelect("source")}</div><div class="field"><label for="reference-select">BI reference export</label>${fileSelect("reference")}</div></div><label class="checkline"><input id="review-plan" type="checkbox" ${advanced ? "checked" : ""}><span>Customize instructions and review a plan first</span></label>${advanced ? `<div class="space"><div class="field"><label for="task-title">Task title</label><input id="task-title" class="input" required maxlength="120" value="${esc(S.draft.title)}"></div><div class="field"><label for="task-instruction">Instructions</label><textarea id="task-instruction" class="input" required minlength="3" maxlength="3000">${esc(S.draft.instruction)}</textarea></div><label class="checkline"><input id="use-ai" type="checkbox" ${S.draft.ai ? "checked" : ""}><span>Use local AI to prepare the execution plan</span></label></div>` : `<div class="workflow-scope">Compare files · Hold differences for your review · Save reconciled results locally</div>`}<div id="task-start-error" class="error-text" role="alert">${esc(S.startError || "")}</div><div class="data-send"><button type="submit" class="btn primary" ${S.startBusy ? "disabled" : ""}>${S.startBusy ? "Starting…" : advanced ? "Create task" : "Start reconciliation"} ${svg("arrow")}</button></div></form></section>`;
 }
+
+function taskProgress(t, planning) {
+  const cancel = t.cancel_requested;
+  const slow = planning && elapsedSeconds(t.operation_started_at || t.updated_at) >= 15;
+  const count = (t.trace || []).filter(step => step.status === "success").length;
+  return `<div class="notice"><div><h3>${cancel ? "Stopping at a safe boundary" : planning ? "Preparing the execution plan" : esc(t.stage || "Starting reconciliation")}</h3><div class="work-metrics">${elapsedLabel(t.operation_started_at)} · ${t.row_count || 0} rows loaded · ${t.archive_count || 0} archive receipts</div>${slow ? '<p>Waiting for the local model. First use can take longer. You can leave this page and return.</p>' : ""}${cancel ? '<p>A local request already in progress may need to finish before stopping.</p>' : ""}</div>${btn(cancel ? "Stop requested" : "Stop", "cancel", "secondary", cancel ? "disabled" : "")}</div>`;
+}
+
 function filesPage() {
   return `${heading("Files & references", "Immutable local imports. Map your own column names to the required fields.", `<a href="/api/template" class="btn secondary">${svg("download")}Field template</a>`)}<div class="two-col"><section class="card"><div class="card-head"><h2>Import source orders</h2></div><div class="card-body">${fileSelect("source")}</div></section><section class="card"><div class="card-head"><h2>Import BI reference export</h2></div><div class="card-body">${fileSelect("reference")}</div></section></div><div class="notice space"><div><h3>Need a public example dataset?</h3></div><div class="flex"><a class="btn secondary" href="/api/examples/source">Source CSV</a><a class="btn secondary" href="/api/examples/reference">Reference CSV</a></div></div><div class="file-list space">${S.files.map((f) => `<article class="file-card"><div class="between"><h3>${svg("file")} ${esc(f.name)}</h3>${badge(f.ready ? "ready" : "pending", f.ready ? "Mapped" : "Mapping needed")}</div><p>${f.role === "reference" ? "BI reference" : "Source orders"} · ${f.row_count} rows · ${date(f.created_at)}</p><div class="between"><span class="tiny mono muted">${esc(f.sha256.slice(0, 12))}…</span>${btn("View mapping", "mapping", "ghost", `data-file-id="${f.id}"`)}</div></article>`).join("") || '<div class="empty"><h3>No records</h3></div>'}</div>`;
 }
@@ -360,7 +437,7 @@ function records(t) {
   return `<div class="table-wrap"><table><thead><tr><th>Row</th><th>Supplier / Order</th><th>Amount</th><th>Payment</th><th>Finding</th></tr></thead><tbody>${t.records.map((r) => `<tr><td class="mono tiny">${r.original_row ?? r.row}</td><td>${esc(r.data.supplier_name || r.data.supplier_id || "Missing supplier")}<div class="tiny muted mono">${esc(r.data.order_id || "—")}</div></td><td class="mono">${display(r.data.amount, "amount")}</td><td>${esc(r.data.payment_status || "—")}</td><td>${t.issues.some((i) => i.row === r.row) ? badge("waiting_confirmation", "Needs review") : badge(t.status === "completed" ? "completed" : "pending", t.status === "completed" ? "Reconciled" : "Read")}</td></tr>`).join("")}</tbody></table>${!t.records.length ? '<div class="empty"><h3>No records</h3></div>' : ""}</div>${t.truncated_preview ? '<p class="detail-text card-body">Preview: first 100 rows</p>' : ""}`;
 }
 function finding(issue) {
-  return `<article class="issue"><div class="top"><input type="checkbox" data-issue="${issue.id}" aria-label="Select ${esc(issueNames[issue.type] || issue.type)} on row ${issue.row || "header"}" ${S.selected.has(issue.id) ? "checked" : ""} ${issue.can_correct ? "" : "disabled"}><div><h3>${esc(issueNames[issue.type] || issue.type)}</h3><p class="meta">${issue.original_row ? "Source row " + issue.original_row : issue.row ? "Working row " + issue.row : "File-level finding"} · ${esc(issue.supplier_id || "—")} / ${esc(issue.order_id || "—")} · ${esc(fieldNames[issue.field] || "Record")}</p></div></div><div class="comparison"><div class="value"><span>Source</span><strong>${display(issue.original_value, issue.field)}</strong></div>${svg("arrow")}<div class="value reference"><span>BI reference</span><strong>${display(issue.reference_value, issue.field)}</strong></div></div><div class="issue-foot"><span>${issue.type === "amount_mismatch" ? "Difference " + amount(issue.difference) : issue.can_correct ? "Your decision is required" : "Correct the source file and create a new task"}</span>${issue.can_correct ? btn("Review correction", "correct", "ghost", `data-issue-id="${issue.id}"`) : ""}</div><p class="detail-text" style="margin:12px 0 0 24px">${esc(issue.message.replaceAll("in the demo", "under the current reconciliation rules"))}</p></article>`;
+  return `<article class="issue"><div class="top"><input type="checkbox" data-issue="${issue.id}" aria-label="Select ${esc(issueNames[issue.type] || issue.type)} on row ${issue.row || "header"}" ${S.selected.has(issue.id) ? "checked" : ""} ${issue.can_correct ? "" : "disabled"}><div><h3>${esc(issueNames[issue.type] || issue.type)}</h3><p class="meta">${issue.original_row ? "Source row " + issue.original_row : issue.row ? "Working row " + issue.row : "File-level finding"} · ${esc(issue.supplier_id || "—")} / ${esc(issue.order_id || "—")} · ${esc(fieldNames[issue.field] || "Record")}</p></div></div><div class="comparison"><div class="value"><span>Source</span><strong>${display(issue.original_value, issue.field)}</strong></div>${svg("arrow")}<div class="value reference"><span>BI reference</span><strong>${display(issue.reference_value, issue.field)}</strong></div></div><div class="issue-foot"><span>${issue.type === "amount_mismatch" ? "Difference " + amount(issue.difference) : issue.can_correct ? "Your decision is required" : "Correct the source file and create a new task"}</span>${issue.can_correct ? btn("Review correction", "correct", "ghost", `data-issue-id="${issue.id}"`) : ""}</div><p class="detail-text" style="margin:12px 0 0 24px">${esc(issue.message.replaceAll("in the demo", "under the current reconciliation rules"))}</p><div data-issue-advice="${esc(issue.id)}">${issueAdvice.render(issue.id)}</div></article>`;
 }
 function reviewPanel(t) {
   return `<div class="between" style="margin-bottom:14px"><label class="checkline"><input id="select-findings" type="checkbox" ${t.issues.filter((i) => i.can_correct).length && t.issues.filter((i) => i.can_correct).every((i) => S.selected.has(i.id)) ? "checked" : ""}>Select correctable findings</label>${btn("Review selected corrections", "correct-selected", "primary", S.selected.size ? "" : "disabled")}</div>${t.issues.map(finding).join("")}${t.truncated_issues ? '<p class="detail-text">Preview: first 200 findings</p>' : ""}${!t.issues.length ? '<div class="info">' + svg("check") + "<div>No unresolved findings</div></div>" : ""}${t.decisions.length ? `<section class="card space"><div class="card-head"><h3>Human decision history</h3></div><div class="card-body">${t.decisions.map((d) => `<div class="log"><time>${date(d.created_at)}</time><div><strong>${esc(d.actor)} · Revision ${d.revision}</strong>${d.reason ? `<p>${esc(d.reason)}</p>` : ""}${d.changes.map((c) => `<p>Row ${c.original_row ?? c.source_row} · ${esc(fieldNames[c.field])}: ${display(c.before, c.field)} → ${display(c.after, c.field)}</p>`).join("")}</div></div>`).join("")}</div></section>` : ""}`;
@@ -369,7 +446,7 @@ function taskPage(t) {
   let banner = "";
   const planning = t.plan_status === "generating";
   if (planning || t.status === "running")
-    banner = `<div class="notice"><div class="flex"><span class="busy accent"></span><div><h3>${planning ? "Generating a local execution plan" : esc(t.stage)}</h3></div></div>${btn("Request cancellation", "cancel", "secondary")}</div>`;
+    banner = taskProgress(t, planning);
   else if (t.status === "completed")
     banner = `<div class="success-banner"><div class="success-icon">${svg("check")}</div><div><h2>Reconciliation complete</h2><p>${t.row_count} orders reconciled against your imported reference. ${t.archive_count} local archive receipts saved.</p></div></div>`;
   else if (t.status === "cancelled")
@@ -380,7 +457,7 @@ function taskPage(t) {
     banner = `<div class="notice error"><div><h3>The operation stopped.</h3><p>${esc(t.error || "Execution was interrupted.")}</p></div>${btn(t.plan_status === "ready" ? "Retry execution" : "Retry plan", t.plan_status === "ready" ? "run" : "plan", "secondary")}</div>`;
   else
     banner = `<div class="notice"><div><h3>${t.plan_status === "ready" ? "Review the plan before starting." : "Generate a plan for this reconciliation."}</h3></div>${btn(t.plan_status === "ready" ? "Approve plan & run " + svg("play") : "Generate plan " + svg("arrow"), t.plan_status === "ready" ? "run" : "plan")}</div>`;
-  return `${t.batch_id ? `<a class="batch-back" href="#batch/${t.batch_id}">← Back to folder batch</a>` : ""}${heading(esc(t.title), `${t.code} · Revision ${t.revision} · ${date(t.updated_at)}`, badge(planning ? "generating" : t.status))}${banner}<div class="stack"><div class="stack"><section class="card"><div class="card-head between"><h2>Reconciliation details</h2><span class="pill">Source currency retained</span></div><div class="task-summary">${[
+  return `${t.batch_id ? `<a class="batch-back" href="#batch/${t.batch_id}">← Back to folder batch</a>` : ""}${heading(esc(t.title), `${t.code} · Revision ${t.revision} · ${date(t.updated_at)}`, badge(planning ? "generating" : t.status))}${banner}${S.taskPollError?.id === t.id && S.taskPollError?.token === S.token ? `<div class="notice error" role="alert"><div><h3>Unable to refresh progress</h3><p>The status below is the last saved result. ${esc(S.taskPollError.message)}</p></div>${btn("Refresh status", "refresh-task", "secondary")}</div>` : ""}<div class="stack"><div class="stack"><section class="card"><div class="card-head between"><h2>Reconciliation details</h2><span class="pill">Source currency retained</span></div><div class="task-summary">${[
     [t.row_count, "Records"],
     [t.issue_count, "Findings"],
     [t.archive_count, "Archived"],
@@ -427,9 +504,12 @@ function archivePage() {
 }
 function settingsPage() {
   const model = S.model || {};
-  return `${heading("Workspace settings", "Local model, data portability and account security.")}<div class="two-col"><div class="stack"><section class="card"><div class="card-head between"><h2>Local AI connection</h2>${badge(model.installed ? "ready" : "pending", model.installed ? "Ready" : "Setup required")}</div><div class="card-body">${[
+  let connection = "Not checked";
+  if (model.available === false) connection = "Service unreachable";
+  if (model.available === true) connection = model.installed ? "Installed" : "Model missing";
+  return `${heading("Workspace settings", "Local model, data portability and account security.")}<div class="two-col"><div class="stack"><section class="card"><div class="card-head between"><h2>Local AI connection</h2>${badge(connection === "Installed" ? "ready" : "pending", connection)}</div><div class="card-body">${[
     ["Provider", "Ollama · loopback only"],
-    ["Model", model.model || "qwen3.5:4b"],
+    ["Model", esc(model.model || "qwen3.5:4b")],
     ["Context window", "8,192 data / 4,096 reconciliation"],
     ["Concurrency", "One active task"],
     ["Cloud inference", "Disabled by application design"],
@@ -440,7 +520,7 @@ function settingsPage() {
     )
     .join(
       "",
-    )}<p class="detail-text space">${esc(model.message || "Checking local service…")}</p><div class="space">${btn(svg("refresh") + " Refresh connection", "refresh-model", "secondary")}</div></div></section><section class="card card-body"><h2>Data backup</h2><div class="space">${btn(svg("download") + " Download backup", "backup", "secondary")}</div></section></div><div class="stack"><section class="card"><div class="card-head"><h2>Change password</h2></div><form class="card-body" id="password-form"><div class="field"><label for="old-password">Current password</label><input id="old-password" class="input" type="password" required autocomplete="current-password"></div><div class="field"><label for="new-password">New password</label><input id="new-password" class="input" type="password" required minlength="6" maxlength="256" autocomplete="new-password"></div><button class="btn secondary" type="submit">Update password</button></form></section></div></div>`;
+    )}<p class="detail-text space">${esc(model.message || "Connection has not been checked yet.")}</p><div class="space">${btn(svg("refresh") + " Refresh connection", "refresh-model", "secondary")}</div></div></section><section class="card card-body"><h2>Data backup</h2><div class="space">${btn(svg("download") + " Download backup", "backup", "secondary")}</div></section></div><div class="stack">${S.session.demo_mode ? "" : `<section class="card"><div class="card-head"><h2>Change password</h2></div><form class="card-body" id="password-form"><div class="field"><label for="old-password">Current password</label><input id="old-password" class="input" type="password" required autocomplete="current-password"></div><div class="field"><label for="new-password">New password</label><input id="new-password" class="input" type="password" required minlength="6" maxlength="256" autocomplete="new-password"></div><button class="btn secondary" type="submit">Update password</button></form></section>`}</div></div>`;
 }
 async function refresh() {
   const response = await api("/tasks");
@@ -450,9 +530,11 @@ async function refresh() {
   S.commands = (await api("/commands")).commands;
 }
 async function navigate() {
-  const token = ++S.token;
+  const token = ++S.token, selectionEpoch = A.epoch, sessionEpoch = S.sessionEpoch;
   try {
-    S.session = await api("/session");
+    const session = await api("/session");
+    if (token !== S.token || sessionEpoch !== S.sessionEpoch) return;
+    S.session = session;
     if (!S.session.username) {
       render();
       return;
@@ -478,8 +560,16 @@ async function navigate() {
       ? route
       : "dashboard";
     S.id = /^\d+$/.test(id || "") ? Number(id) : null;
+    if (S.route === "assistant" && !S.id) {
+      const remembered = assistantRememberedChatId();
+      if (remembered) {
+        S.id = remembered;
+        try { history.replaceState(null, "", "#assistant/" + remembered); } catch {}
+      }
+    }
+    if (S.route === "assistant" && S.id) rememberAssistantChat(S.id);
     await refresh();
-    if (token !== S.token) return;
+    if (token !== S.token || sessionEpoch !== S.sessionEpoch) return;
     if (S.route === "task" && S.id) {
       S.task = await api(taskDetailPath(S.id));
       S.selected.clear();
@@ -496,13 +586,14 @@ async function navigate() {
       if (!S.commandBiFolder) S.commandBiFolder = S.biFolderDraft;
     }
     if (S.route === "batch" && S.id) S.batch = await api("/batches/" + S.id);
-    if (S.route === "assistant") await refreshAssistant();
+    if (S.route === "assistant") await refreshAssistant(token, selectionEpoch);
     if (S.route === "archive") S.archive = (await api("/archive")).records;
     if (S.route === "settings") S.model = await api("/model");
-    if (token !== S.token) return;
+    if (token !== S.token || sessionEpoch !== S.sessionEpoch) return;
     render();
     window.scrollTo(0, 0);
   } catch (error) {
+    if (token !== S.token || sessionEpoch !== S.sessionEpoch) return;
     toast(error.message, true);
     if (!S.session?.username) render();
     else
@@ -512,6 +603,7 @@ async function navigate() {
   }
 }
 function render() {
+  issueAdvice.sync();
   if (!S.session?.username) {
     app.innerHTML = auth();
     return;
@@ -583,7 +675,14 @@ document.addEventListener("click", async (event) => {
   if (!target || target.disabled) return;
   const action = target.dataset.action;
   try {
-    if (action.startsWith("assistant-")) {
+    if (action === "reports-open") {
+      target.disabled = true;
+      await openReportsFolder();
+    } else if (action === "issue-advice") {
+      await issueAdvice.explain(target.dataset.issueId);
+    } else if (action === "refresh-advice-task") {
+      await issueAdvice.refresh(target.dataset.issueId);
+    } else if (action.startsWith("assistant-")) {
       await assistantAction(action, target);
     } else if (action.startsWith("command-")) {
       await commandAction(action, target);
@@ -591,9 +690,17 @@ document.addEventListener("click", async (event) => {
       await batchAction(action, target);
     } else if (action === "close-modal") closeModal();
     else if (action === "logout") {
+      S.sessionEpoch += 1;
+      if (typeof clearAssistantMemory === "function") clearAssistantMemory();
       await post("/logout");
-      S.session = { setup_required: false, username: null };
+      S.session = { setup_required: false, username: null, demo_mode: Boolean(S.session?.demo_mode) };
       render();
+    } else if (action === "refresh-task") {
+      target.disabled = true;
+      const id = S.id, token = S.token;
+      const task = await api(taskDetailPath(id));
+      if (token !== S.token || id !== S.id) return;
+      S.task = task; S.taskPollError = null; render();
     } else if (action === "plan" || action === "run") {
       target.disabled = true;
       await post(`/tasks/${S.id}/${action}`);
@@ -675,6 +782,7 @@ document.addEventListener("input", (event) => {
 document.addEventListener("change", async (event) => {
   try {
     const target = event.target;
+    if (target.id === "review-plan") { S.draft.review_plan = target.checked; render(); }
     if (target.id === "use-ai") S.draft.ai = target.checked;
     if (target.id === "source-select") S.draft.source_id = target.value;
     if (target.id === "reference-select") S.draft.reference_id = target.value;
@@ -718,15 +826,36 @@ document.addEventListener("submit", async (event) => {
     } else if (form.id === "folder-scan-form" || form.id === "batch-table-form") {
       await batchSubmit(form);
     } else if (form.id === "auth-form") {
-      S.session = await post(S.session.setup_required ? "/setup" : "/login", {
+      S.session = S.session.demo_mode ? await post("/demo-login") : await post(S.session.setup_required ? "/setup" : "/login", {
         username: document.getElementById("username").value.trim(),
         password: document.getElementById("password").value,
       });
+      S.sessionEpoch += 1;
       await navigate();
     } else if (form.id === "task-form") {
-      const task = await post("/tasks", S.draft);
-      S.tab = "records";
-      go("task/" + task.id);
+      if (S.startBusy) return;
+      const context = {token: S.token, session: S.sessionEpoch};
+      const {review_plan, ...draft} = S.draft;
+      S.startBusy = true; S.startError = "";
+      if (submit) submit.textContent = "Starting…";
+      try {
+        const task = await post(review_plan ? "/tasks" : "/tasks/quick-start", review_plan ? draft : {
+          title: "Supplier order reconciliation", source_id: draft.source_id, reference_id: draft.reference_id,
+        });
+        if (context.session !== S.sessionEpoch) return;
+        S.tab = "records";
+        if (context.token === S.token) go("task/" + task.id);
+        else toast("Reconciliation saved. Open it in Reconciliations.");
+      } catch (error) {
+        if (context.session === S.sessionEpoch && context.token === S.token) {
+          S.startError = error.message;
+          const box = document.getElementById("task-start-error");
+          if (box) box.textContent = error.message;
+        }
+      } finally {
+        S.startBusy = false;
+        if (submit) submit.textContent = review_plan ? "Create task" : "Start reconciliation";
+      }
     } else if (form.id === "mapping-form") {
       const mapping = Object.fromEntries(
         FIELDS.map((field) => [
@@ -818,7 +947,7 @@ function batchesPage() {
     S.activeBatch ||
     S.active ||
     S.batches.some((b) => ["running", "scanning"].includes(b.status));
-  return `${heading("Folder batches", "Read a folder, reconcile clean rows automatically, and review only exceptions.")}${commandCard()}<section class="card space"><div class="card-head"><h2>Choose folders</h2></div><form id="folder-scan-form" class="card-body"><div class="input-folders">${folderInput("folder-path", "Input folder", S.folderDraft, "pick-folder", true, busy)}${folderInput("bi-folder-path", "BI system folder", S.biFolderDraft, "pick-bi-folder", true, busy)}</div><div class="data-send"><button class="btn primary" type="submit" ${busy ? "disabled" : ""}>${svg("search")}Scan folders</button></div></form></section><section class="card space"><div class="card-head"><h2>Recent folder batches</h2></div>${S.batches.length ? `<div class="table-wrap"><table><thead><tr><th>Batch</th><th>Input folder</th><th>BI system folder</th><th>Status</th><th>Created</th><th></th></tr></thead><tbody>${S.batches.map((b) => `<tr><td class="mono">BATCH-${String(b.id).padStart(5, "0")}</td><td class="batch-folder-cell" title="${esc(b.folder)}">${esc(b.folder)}</td><td class="batch-folder-cell" title="${esc(b.bi_folder || "")}">${esc(b.bi_folder || "—")}</td><td>${badge(b.status)}</td><td>${date(b.created_at)}</td><td><a class="accent" href="#batch/${b.id}">Open ${svg("chevron")}</a></td></tr>`).join("")}</tbody></table></div>` : `<div class="empty">${svg("file")}<h3>No folder batches yet</h3></div>`}</section>`;
+  return `${heading("Folder batches", "", btn("Open reports folder", "reports-open", "secondary"))}${commandCard()}<section class="card space"><div class="card-head"><h2>Choose folders</h2></div><form id="folder-scan-form" class="card-body"><div class="input-folders">${folderInput("folder-path", "Input folder", S.folderDraft, "pick-folder", true, busy)}${folderInput("bi-folder-path", "BI system folder", S.biFolderDraft, "pick-bi-folder", true, busy)}</div><div class="data-send"><button class="btn primary" type="submit" ${busy ? "disabled" : ""}>${svg("search")}Scan folders</button></div></form></section><section class="card space"><div class="card-head"><h2>Recent folder batches</h2></div>${S.batches.length ? `<div class="table-wrap"><table><thead><tr><th>Batch</th><th>Input folder</th><th>BI system folder</th><th>Status</th><th>Created</th><th></th></tr></thead><tbody>${S.batches.map((b) => `<tr><td class="mono">BATCH-${String(b.id).padStart(5, "0")}</td><td class="batch-folder-cell" title="${esc(b.folder)}">${esc(b.folder)}</td><td class="batch-folder-cell" title="${esc(b.bi_folder || "")}">${esc(b.bi_folder || "—")}</td><td>${badge(b.status)}</td><td>${date(b.created_at)}</td><td><a class="accent" href="#batch/${b.id}">Open ${svg("chevron")}</a></td></tr>`).join("")}</tbody></table></div>` : `<div class="empty">${svg("file")}<h3>No folder batches yet</h3></div>`}</section>`;
 }
 function batchPage(b) {
   const busy = b.busy || ["scanning", "running"].includes(b.status);
@@ -920,7 +1049,8 @@ async function batchAction(action, target) {
     target.disabled = true;
     const exported = await post(`/batches/${S.id}/export`);
     if (exported.handled) {
-      toast(exported.saved ? "Excel report saved." : "Save cancelled.");
+      if (exported.saved) await openReportsFolder();
+      else toast("The report could not be saved.", true);
       return;
     }
     const response = await fetch(exported.download_url, {
@@ -1016,11 +1146,15 @@ setInterval(async () => {
     const task = await api(taskDetailPath(id));
     if (token !== S.token || S.id !== id) return;
     S.task = task;
+    S.taskPollError = null;
     if (task.status !== "running" && task.plan_status !== "generating")
       await refresh();
     render();
   } catch (error) {
-    toast(error.message, true);
+    if (token === S.token && S.id === id && S.session?.username) {
+      S.taskPollError = {id, token, message: error.message};
+      render();
+    }
   } finally {
     polling = false;
   }

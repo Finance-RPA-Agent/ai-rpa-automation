@@ -338,7 +338,7 @@ def test_prepared_browser_export_is_authenticated_and_readable(local, monkeypatc
     csv_file(inbox / "orders.csv", ROWS)
     csv_file(inbox / "reference.csv", ROWS)
     batch = run(local, scan(local)["id"])
-    monkeypatch.setattr("product.native_reports.webview.windows", [])
+    monkeypatch.setattr("product.native_reports.save_report", lambda *args: {"handled": False})
     response = client.post(f"/api/batches/{batch['id']}/export")
     assert response.status_code == 200, response.text
     assert response.json()["handled"] is False
@@ -353,27 +353,21 @@ def test_prepared_browser_export_is_authenticated_and_readable(local, monkeypatc
     assert client.get(path).status_code == 401
 
 
-def test_native_report_save_and_cancel_do_not_change_reconciliation(local, monkeypatch, tmp_path):
-    client, _, inbox = local
+def test_report_is_automatically_saved_separately_without_changing_reconciliation(local):
+    client, service, inbox = local
     csv_file(inbox / "orders.csv", ROWS)
     csv_file(inbox / "reference.csv", ROWS)
     batch = run(local, scan(local)["id"])
-    target = tmp_path / "chosen-report.xlsx"
-    class Window:
-        selected = (str(target),)
-        def create_file_dialog(self, dialog_type, **options):
-            assert options["save_filename"].endswith(".xlsx")
-            return self.selected
-    window = Window()
-    monkeypatch.setattr("product.native_reports.webview.windows", [window])
+    reports = service.store.root / "exports" / "Reports"
+    automatic = service.path(service.batches.batch(batch["id"])["report_path"])
+    assert automatic.parent == reports and automatic.is_file()
+    original_bytes = automatic.read_bytes()
     response = client.post(f"/api/batches/{batch['id']}/export")
     assert response.status_code == 200 and response.json()["saved"]
+    target = Path(response.json()["path"])
+    assert target.parent == reports
     workbook = load_workbook(target)
     assert workbook["Summary"]["B4"].value == "FINAL - completed"
     workbook.close()
-    original_bytes = target.read_bytes()
-    window.selected = None
-    response = client.post(f"/api/batches/{batch['id']}/export")
-    assert response.status_code == 200 and response.json()["cancelled"]
-    assert target.read_bytes() == original_bytes
+    assert automatic.read_bytes() == original_bytes
     assert client.get(f"/api/batches/{batch['id']}").json()["archive_receipts"] == 3

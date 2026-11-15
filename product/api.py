@@ -84,6 +84,12 @@ class CreateTask(Input):
     ai: bool = True
 
 
+class QuickTask(Input):
+    title: str = Field(default="Supplier order reconciliation", min_length=1, max_length=120)
+    source_id: str
+    reference_id: str
+
+
 class Change(Input):
     issue_id: str
     mode: str = Field(pattern="^(reference|manual)$")
@@ -97,6 +103,11 @@ class Review(Input):
     reason: str = Field(default="", max_length=1500)
 
 
+class IssueExplanation(Input):
+    revision: int = Field(ge=1)
+    evidence_digest: str = Field(pattern="^[0-9a-f]{64}$", min_length=64, max_length=64)
+
+
 class PasswordChange(Input):
     current_password: str = Field(min_length=1, max_length=256)
     new_password: str = Field(min_length=6, max_length=256)
@@ -107,8 +118,21 @@ def data_directory():
     return base / "FinanceFlow"
 
 
-def create_app(directory=None, *, model=None):
-    service = ProductService(Path(directory or data_directory()), model=model)
+def workspace_directory(directory=None, *, demo=False):
+    base = Path(directory or data_directory()).resolve()
+    return base / "demo" if demo else base
+
+
+def create_app(directory=None, *, model=None, demo=False):
+    directory = workspace_directory(directory, demo=demo)
+    if demo:
+        # Never enable password-free entry for a pre-existing ordinary workspace.
+        marker = directory / ".finance-flow-demo"
+        if (directory / "finance-flow.sqlite").exists() and not marker.is_file():
+            raise ValueError("This directory is not a demo workspace. Choose another --data-dir.")
+        directory.mkdir(parents=True, exist_ok=True)
+        marker.touch(exist_ok=True)
+    service = ProductService(directory, model=model)
     login_failures = []
 
     @asynccontextmanager
@@ -161,7 +185,7 @@ def create_app(directory=None, *, model=None):
             db.execute("DELETE FROM sessions WHERE expires<?", (time.time(),))
             db.execute("INSERT INTO sessions VALUES(?,1,?)", (hashlib.sha256(token.encode()).hexdigest(), time.time() + 12 * 3600))
         response.set_cookie("finance_session", token, max_age=12 * 3600, httponly=True, samesite="strict", path="/")
-        return {"username": username}
+        return {"username": username, "demo_mode": demo}
 
     @app.get("/api/health")
     def health():
@@ -174,10 +198,24 @@ def create_app(directory=None, *, model=None):
             username = account(request)
         except HTTPException:
             username = None
-        return {"setup_required": setup, "username": username}
+        return {"setup_required": setup and not demo, "username": username, "demo_mode": demo}
+
+    @app.post("/api/demo-login")
+    def demo_login(response: Response):
+        if not demo:
+            raise HTTPException(404, "Demo entry is not enabled for this workspace.")
+        with service.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not db.execute("SELECT id FROM users WHERE id=1").fetchone():
+                db.execute("INSERT INTO users VALUES(1,?,?,?)",
+                           ("Demo User", PASSWORDS.hash(secrets.token_urlsafe(32)), timestamp()))
+            user = db.execute("SELECT username FROM users WHERE id=1").fetchone()
+        return sign_in(user["username"], response)
 
     @app.post("/api/setup")
     def setup(body: Credentials, response: Response):
+        if demo:
+            raise HTTPException(409, "Use Enter demo for this demonstration workspace.")
         if len(body.password) < 6 or not body.username.strip():
             raise HTTPException(422, "Choose a username and a password of at least 6 characters.")
         with service.store.connect() as db:
@@ -211,6 +249,8 @@ def create_app(directory=None, *, model=None):
 
     @app.post("/api/password")
     def change_password(body: PasswordChange, response: Response, actor=Depends(account)):
+        if demo:
+            raise HTTPException(409, "Demo entry does not use a password.")
         user = service.store.one("SELECT * FROM users WHERE id=1")
         if not PASSWORDS.verify(body.current_password, user["password_hash"]):
             raise HTTPException(401, "Current password is incorrect.")
@@ -255,6 +295,11 @@ def create_app(directory=None, *, model=None):
     def assistant_report(artifact_id: str, _actor=Depends(account)):
         path = service.assistant.artifact(artifact_id)
         return FileResponse(path, filename=path.name, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    @app.post("/api/reports/open")
+    def open_reports(_actor=Depends(account)):
+        from product.native_reports import open_report_folder
+        return open_report_folder(service.store.root / "exports" / "Reports")
 
     @app.post("/api/assistant/artifacts/{artifact_id}/export")
     def assistant_export(artifact_id: str, _actor=Depends(account)):
@@ -324,7 +369,9 @@ def create_app(directory=None, *, model=None):
         service.batches.batch(batch_id)
         if not re.fullmatch(rf"FinanceFlow-BATCH-{batch_id:05d}-[a-f0-9]{{10}}\.xlsx", filename):
             raise HTTPException(404, "Report file was not found.")
-        path = service.path("exports/" + filename)
+        path = service.path("exports/Reports/" + filename)
+        if not path.is_file():
+            path = service.path("exports/" + filename)  # Preserve older prepared links.
         if not path.is_file():
             raise HTTPException(404, "Report file was not found.")
         return FileResponse(path, filename=f"FinanceFlow-BATCH-{batch_id:05d}.xlsx",
@@ -366,6 +413,12 @@ def create_app(directory=None, *, model=None):
             raise HTTPException(422, "Task title and instructions are required.")
         return service.create(body.title.strip(), body.instruction.strip(), body.source_id, body.reference_id, body.ai)
 
+    @app.post("/api/tasks/quick-start", status_code=201)
+    def quick_start(body: QuickTask, actor=Depends(account)):
+        if not body.title.strip():
+            raise HTTPException(422, "Task title is required.")
+        return service.quick_start(body.title.strip(), body.source_id, body.reference_id, actor)
+
     @app.get("/api/tasks/{job_id}")
     def detail(job_id: int, batch_id: int | None = None, _actor=Depends(account)):
         return service.detail(job_id, batch_id=batch_id)
@@ -377,6 +430,10 @@ def create_app(directory=None, *, model=None):
     @app.post("/api/tasks/{job_id}/run")
     def run(job_id: int, actor=Depends(account)):
         return service.schedule(job_id, "run", actor)
+
+    @app.post("/api/tasks/{job_id}/issues/{issue_id}/explanation")
+    def explain_issue(job_id: int, issue_id: str, body: IssueExplanation, _actor=Depends(account)):
+        return service.explain_issue(job_id, issue_id, body.revision, body.evidence_digest)
 
     @app.post("/api/tasks/{job_id}/review")
     def review(job_id: int, body: Review, actor=Depends(account)):
@@ -405,6 +462,7 @@ def create_app(directory=None, *, model=None):
 
     @app.get("/api/archive")
     def archive(_actor=Depends(account)):
+        service.check_archive_recovery()
         return {"records": [dict(row, data=json.loads(row["payload_json"])) for row in service.store.all("SELECT * FROM archive ORDER BY created_at DESC")]}
 
     @app.get("/api/model")

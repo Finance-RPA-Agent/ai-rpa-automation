@@ -492,7 +492,7 @@ class DataTools:
         for column in ("A", "B", "C", "D"): operations.column_dimensions[column].width = 40
         operations.freeze_panes = "A2"
         artifact_id = secrets.token_hex(12)
-        relative = f"exports/Assistant-{artifact_id}.xlsx"; path = self.service.path(relative)
+        relative = f"exports/Reports/Assistant-{artifact_id}.xlsx"; path = self.service.path(relative)
         workbook.save(path); workbook.close()
         artifact = {"id": artifact_id, "title": title, "name": path.name, "url": f"/api/assistant/artifacts/{artifact_id}", "frame_ids": frame_ids,
                     "row_count": sum(len(frame) for frame in frames), "turn_id": self.turn_id,

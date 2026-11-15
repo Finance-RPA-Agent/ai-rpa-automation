@@ -89,7 +89,7 @@ UPDATE settings SET value='4' WHERE key='schema_version' AND value IN ('1','2','
 class Store:
     def __init__(self, directory):
         self.root = Path(directory).resolve()
-        for folder in ("files", "jobs", "exports", "backups"):
+        for folder in ("files", "jobs", "exports", "exports/Reports", "backups"):
             (self.root / folder).mkdir(parents=True, exist_ok=True)
         self.path = self.root / "finance-flow.sqlite"
         with self.connect() as db:

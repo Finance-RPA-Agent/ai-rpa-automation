@@ -14,7 +14,7 @@ from product.folder_tables import (
     MAX_BATCH_BYTES, MAX_BATCH_ROWS, MAX_FILES, MAX_TABLES,
     canonical_bytes, infer_role, read_tables,
 )
-from product.input_folders import select_inputs
+from product.input_folders import select_inputs, generated_report
 from product.service import Cancelled, FIELDS, MAX_BYTES, result
 from product.storage import digest, encode, timestamp
 
@@ -134,7 +134,7 @@ class FolderBatches:
             raise Cancelled()
 
     def _files(self, folder):
-        excluded = {".git", ".venv", "node_modules", "__pycache__", "runtime", "backups", "exports"}
+        excluded = {".git", ".venv", "node_modules", "__pycache__", "runtime", "backups", "exports", "reports"}
         def unreadable(error):
             raise OSError(f"An input folder could not be read: {error.filename}. Check its permissions and scan again.") from error
         for base, directories, files in os.walk(folder, followlinks=False, onerror=unreadable):
@@ -149,6 +149,8 @@ class FolderBatches:
             for name in sorted(files):
                 path = root / name
                 if path.suffix.lower() not in (".csv", ".xlsx") or name.startswith(("~$", ".", "FinanceFlow-BATCH-")):
+                    continue
+                if generated_report(path):
                     continue
                 if path.is_symlink() or not path.resolve().is_relative_to(folder):
                     continue
@@ -537,7 +539,7 @@ class FolderBatches:
             if view["status"] in ("running", "scanning"):
                 raise HTTPException(409, "Wait for the batch to stop before downloading its report.")
             from product.excel_report import create_batch_report
-            target = self.store.root / "exports" / f"FinanceFlow-{view['code']}-{secrets.token_hex(5)}.xlsx"
+            target = self.store.root / "exports" / "Reports" / f"FinanceFlow-{view['code']}-{secrets.token_hex(5)}.xlsx"
             create_batch_report(self, view, target)
             with self.store.connect() as db:
                 db.execute("UPDATE batches SET report_path=? WHERE id=?", (str(target.relative_to(self.store.root)), batch_id))

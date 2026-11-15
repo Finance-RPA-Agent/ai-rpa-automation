@@ -66,18 +66,27 @@ def main():
     parser.add_argument("--no-open", action="store_true", help="Run the local service without opening a window")
     parser.add_argument("--port", type=int, default=8877)
     parser.add_argument("--data-dir", type=Path)
+    parser.add_argument("--demo", action="store_true", help="Use a separate demo workspace with one-click entry")
+    parser.add_argument("--no-auto-ollama", action="store_true", help="Do not automatically start the local model service")
     parser.add_argument("--restore", type=Path, help="Restore a verified backup into an empty --data-dir")
     options = parser.parse_args()
-    from product.api import create_app, data_directory
+    from product.api import create_app, workspace_directory
     from product import __version__
-    directory = (options.data_dir or data_directory()).resolve()
+    directory = workspace_directory(options.data_dir, demo=options.demo)
     if options.restore:
+        if options.demo:
+            parser.error("Use --restore without --demo to restore a workspace.")
         if not options.data_dir:
             parser.error("--restore requires an explicit empty --data-dir.")
         restore_backup(options.restore, directory)
         return 0
     if not 1024 <= options.port <= 65535:
         parser.error("Port must be between 1024 and 65535.")
+    if not options.no_auto_ollama:
+        from product.model_startup import ensure_ollama
+        print("Checking local Ollama…", flush=True)
+        startup = ensure_ollama()
+        print(startup["message"], flush=True)
     directory.mkdir(parents=True, exist_ok=True)
     lock_path = directory / "application.lock"
     lock = lock_path.open("a+b")
@@ -115,7 +124,7 @@ def main():
         url = f"http://127.0.0.1:{options.port}"
         (directory / "instance.json").write_text(json.dumps({"port": options.port, "pid": os.getpid()}))
         import uvicorn
-        app = create_app(directory)
+        app = create_app(options.data_dir, demo=options.demo)
         server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=options.port, log_level="warning"))
         print(f"Finance Flow {__version__}\nWorkspace: {directory}\nLocal address: {url}")
         if options.no_open:

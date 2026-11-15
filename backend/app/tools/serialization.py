@@ -27,7 +27,12 @@ def to_jsonable(value):
     if isinstance(value, Decimal):
         if not value.is_finite():
             return None
-        return float(value)
+        # Keep ordinary whole amounts compatible without creating binary floats.
+        # Larger integers must be text too: browser JSON numbers lose precision
+        # beyond the exact safe-integer range. Fractions retain every decimal.
+        if value == value.to_integral_value() and value.copy_abs() <= 9007199254740991:
+            return int(value)
+        return format(value, "f")
 
     if isinstance(value, (datetime, date, time)):
         return value.isoformat()
