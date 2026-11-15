@@ -9,13 +9,13 @@ Use a fresh workspace. The supplied records are synthetic. Open the two CSV file
 ### 1. Establish a clean comparison
 
 1. Under **Files & references**, import `bi_reference.csv` twice, once as source orders and once as BI reference. Using the same fixture in both roles gives a known matching control. Check the seven mapped columns and four rows.
-2. Create an individual reconciliation with those two imports. Give it a title such as **Demo – matching orders** and an instruction to compare the four orders. Clear **Use local AI to prepare the execution plan**.
-3. Choose **Generate plan**, inspect the proposed steps and click **Approve plan & run**. Expect a completed task with four rows, four local receipts and no review decisions.
+2. Open **New reconciliation** and select those two imports. Leave **Customize instructions and review a plan first** unchecked to use the fixed local workflow.
+3. Click **Start reconciliation**. Expect a completed task with four rows, four local receipts and no review decisions. For an optional custom plan, enable the checkbox, create the task, generate its plan and explicitly approve it before running.
 4. Download the reconciled CSV and full JSON report. The four order IDs and amounts should match the reference. Open the local archive and locate the receipts for this task.
 
 ### 2. Hold a discrepancy for a reviewer
 
-1. Import `orders_for_review.csv` as a new source. Create a second task with this source and the same BI reference. Keep local AI planning off. Generate the plan, inspect it and approve the run.
+1. Import `orders_for_review.csv` as a new source. Open **New reconciliation**, select this source and the same BI reference, then click **Start reconciliation** using the default fixed workflow.
 2. Open **Review findings**. Compare each held row with the reference below before choosing **Review correction** and the reference value. Use **Save corrections & revalidate**. Additional differences may become visible once required fields are valid.
 
    | Order | Source | BI reference | Expected reviewer action |

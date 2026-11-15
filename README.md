@@ -12,23 +12,27 @@ Finance Flow is a Windows-first desktop application for reconciling supplier ord
    & ".\Setup Finance Flow.cmd"
    ```
 
-3. Run `Start Finance Flow.cmd` and create a local owner account on first use. To use your default browser instead of the desktop window, run the following from the same folder.
+3. Run `Start Finance Flow.cmd` and click **Enter demo**. The launcher now uses a separate demo workspace with a fixed display account; no password is required. To use your default browser instead of the desktop window, run the following from the same folder.
 
    ```powershell
-   .\.venv\Scripts\python.exe start_product.py --browser
+   .\.venv\Scripts\python.exe start_product.py --demo --browser
    ```
 
-4. For the first demonstration, use **Reconciliations** and clear **Use local AI to prepare the execution plan** when creating each task. This route needs neither Ollama nor a model download. The walkthrough gives the two input files, expected differences and final receipt counts. [Run the four-order demonstration](docs/FINANCEFLOW_V1_DELIVERY.md#four-order-demonstration)
+4. For the first demonstration, open **New reconciliation**, select the source and BI files, then click **Start reconciliation**. The default fixed workflow needs neither Ollama nor separate plan approval; differences still require human review. The walkthrough gives the two input files, expected differences and final receipt counts. [Run the four-order demonstration](docs/FINANCEFLOW_V1_DELIVERY.md#four-order-demonstration)
 
 ## What to try
 
 | Workspace | Task | Result |
 | --- | --- | --- |
-| **Reconciliations** | Import two files, inspect the plan and review a held difference. | A signed-in reviewer decides which values to use. Completed tasks expose a reconciled CSV, JSON report and local receipts. |
+| **Reconciliations** | Select two files, start reconciliation and review a held difference. Optional custom plans remain available. | A signed-in reviewer decides which values to use. Completed tasks expose a reconciled CSV, JSON report and local receipts. |
 | **Folder batches** | Select separate input and BI folders, scan the tables, confirm mappings and run. | Clean rows can complete while exceptions remain open. The Excel report shows row-level outcomes. |
-| **Data assistant** | Ask a question about a captured folder and inspect the operations, evidence and workbook. | General natural-language analysis needs the optional local Ollama model `qwen3.5:4b`. |
+| **Data assistant** | Choose an editable task example or write a request; inspect live stages, saved operations and the workbook. | General natural-language analysis needs the optional local Ollama model `qwen3.5:4b`. |
 
 The linked guides cover account setup, input limits, backups, optional AI, sample provenance and the scope of delivery testing. Node is needed only for the JavaScript regression suites. [Product guide](product/README.md) · [Delivery notes and test record](docs/FINANCEFLOW_V1_DELIVERY.md)
+
+The demo stores its files in `%LOCALAPPDATA%\FinanceFlow\demo`. The username and masked password on its entry page are display fields only. Existing owner accounts and ordinary workspace data remain available by running `.\.venv\Scripts\python.exe start_product.py` without `--demo`.
+
+The launcher automatically checks the local Ollama service and starts an installed copy in the background if needed. It reuses a running service and does not download models or run inference during startup. If the model is missing, install it once with `ollama pull qwen3.5:4b`. Use `--no-auto-ollama` to skip automatic startup.
 
 ## Project background and legacy development API
 
@@ -41,3 +45,7 @@ Developers working on the original MVP can start its separate API in a disposabl
 ```
 
 Open `http://127.0.0.1:8000/docs` for that API. For the Finance Flow review and all sample steps, use the product launcher on port 8877. The delivery notes identify the original team contribution, the assistant navigation work from leng327's PR #3 and the subsequent review work.
+
+## Test the downloaded source
+
+The full automated suites and example folders are included. See [TESTING.md](TESTING.md) for dependencies, one-command tests and manual input/BI examples. After setup, double-click Run Tests.cmd or run the Python test runner.

@@ -1641,6 +1641,18 @@ th { color: #6b6e67; }
 .data-review-card .stats { margin-bottom: 18px; }
 
 /* R3B read-only advice, separate from human correction controls. */
+.task-examples { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0; }
+.task-examples .btn { padding: 9px 13px; min-height: 38px; font-size: 14px; }
+.workflow-scope { margin-top: 18px; padding: 14px 16px; border-radius: 8px; background: #f4f3f1; color: #454b51; line-height: 1.6; }
+.work-status { margin: 16px 0; padding: 16px; border: 1px solid #dededb; border-radius: 9px; background: #f8f8f6; }
+.work-status p, .notice p { line-height: 1.6; }
+.work-metrics, .work-summary { margin-top: 9px; color: #515962; font-size: 14px; line-height: 1.6; }
+.work-status .data-working { flex-wrap: wrap; }
+.work-status .data-working button { margin-left: auto; }
+.work-summary { margin-bottom: 14px; }
+.notice { gap: 18px; }
+@media (max-width: 650px) { .task-examples .btn { flex: 1 1 44%; } }
+
 .issue-advice { margin: 16px 0 0 24px; padding: 16px; border: 1px solid #d5dce6; border-radius: 10px; background: #f8fafc; }
 .advice-result { margin-top: 12px; overflow-wrap: anywhere; }
 .advice-result h4 { margin: 12px 0 8px; font-size: 14px; }

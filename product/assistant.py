@@ -137,6 +137,8 @@ class DataAssistant:
         for row in self.store.all("SELECT * FROM data_turns WHERE chat_id=? ORDER BY id", (chat_id,)):
             turn = json.loads(row["state_json"])
             item = {"id": row["id"], "instruction": row["instruction"], "status": row["status"], **turn}
+            item.update(created_at=row["created_at"], updated_at=row["updated_at"],
+                        cancel_requested=self.service.assistant_active == row["id"] and self.service.cancel_signal.is_set())
             item["can_retry"] = row["status"] in ("failed", "cancelled") or (row["status"] == "needs_input" and bool(chat["bi_folder"]) and review_requested(row["instruction"]))
             if turn.get("workflow") == "reconciliation_review" and turn.get("batch_id"):
                 batch = self.service.batches.describe(turn["batch_id"])
@@ -228,6 +230,8 @@ class DataAssistant:
             history = self.store.all("SELECT instruction,state_json FROM data_turns WHERE chat_id=? AND id<? ORDER BY id DESC LIMIT 4", (chat_id, turn_id))
             plan_schema = Plan.model_json_schema()
             plan_schema["properties"]["required_tools"]["items"] = {"type": "string", "enum": list(SPECS)}
+            turn["progress"] = {"phase": "planning", "since": timestamp()}
+            self.persist(chat_id, turn_id, state, turn, "running")
             plan = Plan.model_validate(self.service.model.data_plan({"request": instruction,
                 "latest_frame": state["latest_frame"], "frames": [{"id": key, "columns": info["columns"][:25]} for key, info in list(state["frames"].items())[-5:]],
                 "files": tools.list_files()["files"][:30],
@@ -268,6 +272,8 @@ class DataAssistant:
                 context["difference_chart_required"] = wants_difference_chart(instruction)
                 if count_guard: context["request_constraint"] = count_guard.context()
                 context["_frame_catalog"] = [{"id": key, "columns": info["columns"], "rows": info["rows"], "difference_columns": info.get("difference_columns", [])} for key, info in state["frames"].items()]
+                turn["progress"] = {"phase": "waiting_model", "since": timestamp()}
+                self.persist(chat_id, turn_id, state, turn, "running")
                 action = Action.model_validate(self.service.model.data_action(context, Action.model_json_schema()))
                 if self.service.cancel_signal.is_set(): status = "cancelled"; break
                 if action.action in ("final", "ask"):
@@ -331,6 +337,8 @@ class DataAssistant:
                         info = state["frames"].get(action.arguments.get("frame_id"), {})
                         if action.arguments.get("y") not in info.get("difference_columns", []):
                             raise ValueError("The requested chart must plot a computed amount difference, not order counts. Aggregate the detail difference with op=sum into the summary or subtract the two summary amount totals, then plot that difference column.")
+                    turn["progress"] = {"phase": "tool", "tool": action.tool, "since": timestamp()}
+                    self.persist(chat_id, turn_id, state, turn, "running")
                     result = tools.call(action.tool, action.arguments)
                     if count_guard: count_guard.after(action.tool, action.arguments, result)
                     failures = 0

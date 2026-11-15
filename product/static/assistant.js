@@ -1,8 +1,8 @@
 "use strict";
-const A = {chat: null, chats: [], draft: "", folder: "", biFolder: "", busy: false, polling: false, error: "", selectedId: null, epoch: 0, operation: 0, detailRead: 0};
+const A = {chat: null, chats: [], draft: "", folder: "", biFolder: "", busy: false, polling: false, error: "", pollError: null, selectedId: null, epoch: 0, operation: 0, detailRead: 0};
 function clearAssistantMemory() {
   A.chat = null; A.chats = []; A.draft = ""; A.folder = ""; A.biFolder = "";
-  A.busy = false; A.polling = false; A.error = ""; A.selectedId = null;
+  A.busy = false; A.polling = false; A.error = ""; A.pollError = null; A.selectedId = null;
   A.epoch += 1; A.operation += 1; A.detailRead += 1;
 }
 function assistantRememberedChatId() {
@@ -47,6 +47,7 @@ function assistantDetailReadCurrent(view, read) {
 function applyAssistantChat(chat, view, read) {
   if (!assistantDetailReadCurrent(view, read) || chat.id !== view.chatId) return false;
   A.chat = chat;
+  A.pollError = null;
   A.folder = chat.folder; A.biFolder = chat.bi_folder || "";
   return true;
 }
@@ -81,6 +82,39 @@ const dataToolLabels = {reconcile_review: "Reconcile and review", list_files: "F
   fill_missing: "Fill missing values", normalize_text: "Clean text", concatenate: "Append tables", join_tables: "Join tables",
   aggregate: "Group and calculate", derive_column: "Calculate a column", create_chart: "Create chart", export_report: "Create Excel report"};
 
+
+// Starting points fill the editable request only; they never submit a task.
+const assistantTasks = [
+  {id: "quality", label: "Check data quality", request: "Inspect every input table for missing values and duplicate rows, and export a data quality summary to Excel. Keep the original files unchanged."},
+  {id: "combine", label: "Combine tables", request: "Append all input tables with matching columns, keep all rows, and export the combined table to Excel. If their columns differ, ask me how to combine them."},
+  {id: "count", label: "Count orders", request: "Count order_id across all input rows, without grouping, and export the order_count result to an Excel report."},
+  {id: "reconcile", label: "Reconcile & review", request: "Reconcile all input orders against the BI reference, archive clean records locally, hold discrepancies for human review, and generate an Excel report without automatically applying corrections."},
+];
+function assistantExamples(disabled) {
+  return `<div class="task-examples" aria-label="Task starting points">${assistantTasks.map(item => `<button type="button" class="btn secondary" data-action="assistant-example" data-example="${item.id}" ${disabled ? "disabled" : ""}>${esc(item.label)}</button>`).join("")}</div>`;
+}
+function elapsedSeconds(value) {
+  const start = Date.parse(value);
+  return Number.isFinite(start) ? Math.max(0, Math.floor((Date.now() - start) / 1000)) : 0;
+}
+function elapsedLabel(value) {
+  if (!value || !Number.isFinite(Date.parse(value))) return "Time unavailable";
+  const seconds = elapsedSeconds(value);
+  return seconds < 60 ? `${seconds}s elapsed` : `${Math.floor(seconds / 60)}m ${seconds % 60}s elapsed`;
+}
+function assistantProgress(turn) {
+  const done = (turn.steps || []).filter(step => step.status === "success").length;
+  if (turn.status !== "running") {
+    const labels = {completed: "Completed", failed: "Stopped with an error", cancelled: "Stopped", needs_input: "Needs your input", waiting_confirmation: "Needs your review"};
+    return `<div class="work-summary" role="status">${esc(labels[turn.status] || turn.status)} · ${done} completed operations</div>`;
+  }
+  const progress = turn.progress || {};
+  const model = ["planning", "waiting_model"].includes(progress.phase);
+  const label = turn.cancel_requested ? "Stop requested" : progress.phase === "planning" ? "Planning with the local model" : progress.phase === "waiting_model" ? "Waiting for the local model's next step" : progress.phase === "tool" ? `Running: ${dataToolLabels[progress.tool] || progress.tool}` : turn.workflow === "reconciliation_review" ? "Running reconciliation" : "Starting local processing";
+  const slow = model && elapsedSeconds(progress.since) >= 15;
+  return `<div class="work-status" role="status"><div class="data-working"><span class="busy"></span><strong>Working locally · ${esc(label)}</strong><button class="btn ghost" data-action="assistant-cancel" data-turn="${turn.id}" ${turn.cancel_requested ? "disabled" : ""}>${turn.cancel_requested ? "Stopping…" : "Stop"}</button></div><div class="work-metrics">${elapsedLabel(turn.created_at)} · ${done} completed operations</div>${turn.cancel_requested ? '<p>The current local request may need to finish before stopping. Saved results are retained.</p>' : slow ? '<p>The local model is taking longer. First use can be slower. You can leave this page and return; use Stop to request cancellation.</p>' : ""}</div>`;
+}
+
 function folderInput(id, label, value, action, required = false, disabled = false) {
   return `<div class="field"><label for="${id}">${label}</label><div class="folder-select"><input id="${id}" class="input" maxlength="4096" ${required ? "required" : ""} ${disabled ? "disabled" : ""} value="${esc(value || "")}"><button class="btn secondary" type="button" aria-label="Browse ${esc(label.replace(' (optional)', ''))}" data-action="${action}" ${disabled ? "disabled" : ""}>Browse…</button></div></div>`;
 }
@@ -88,14 +122,14 @@ function folderLocations(folder, biFolder, files = []) {
   return `<div class="folder-locations"><div><strong>Input folder</strong><span>${esc(folder)}</span>${files.length ? `<span class="pill">${files.filter(file => file.group !== "bi").length} files</span>` : ""}</div>${biFolder ? `<div><strong>BI system folder</strong><span>${esc(biFolder)}</span>${files.length ? `<span class="pill">${files.filter(file => file.group === "bi").length} files</span>` : ""}</div>` : ""}</div>`;
 }
 function assistantEntry() {
-  return `<section class="card data-entry"><div class="card-head"><h2>What would you like to do with your data?</h2></div><form id="assistant-form" class="card-body"><label for="assistant-request">Your request</label><textarea id="assistant-request" class="input command-input" required minlength="3" maxlength="3000" ${A.busy ? "disabled" : ""} placeholder="Process the input files and compare them with the BI reference data.">${esc(A.draft)}</textarea><div class="input-folders">${folderInput("assistant-folder", "Input folder", A.folder, "assistant-pick", true, A.busy)}${folderInput("assistant-bi-folder", "BI system folder (optional)", A.biFolder, "assistant-pick-bi", false, A.busy)}</div><div class="data-send"><button class="btn primary" type="submit" ${A.busy ? "disabled" : ""}>${A.busy ? "Opening…" : "Start task"} ${svg("arrow")}</button></div>${A.error ? `<p class="error-text" role="alert">${esc(A.error)}</p>` : ""}</form></section>`;
+  return `<section class="card data-entry"><div class="card-head"><h2>What would you like to do with your data?</h2></div><form id="assistant-form" class="card-body"><label for="assistant-request">Your request</label><textarea id="assistant-request" class="input command-input" required minlength="3" maxlength="3000" ${A.busy ? "disabled" : ""} placeholder="Describe your task, or choose a starting point below.">${esc(A.draft)}</textarea>${assistantExamples(A.busy)}<div class="input-folders">${folderInput("assistant-folder", "Input folder", A.folder, "assistant-pick", true, A.busy)}${folderInput("assistant-bi-folder", "BI system folder (optional)", A.biFolder, "assistant-pick-bi", false, A.busy)}</div><div class="data-send"><button class="btn primary" type="submit" ${A.busy ? "disabled" : ""}>${A.busy ? "Opening…" : "Start task"} ${svg("arrow")}</button></div>${A.error ? `<p class="error-text" role="alert">${esc(A.error)}</p>` : ""}</form></section>`;
 }
 
 function assistantPage() {
   const chat = A.chat, active = chat?.active_turn;
-  const actions = `<div class="flex"><select id="assistant-history" aria-label="Open conversation"><option value="">Conversations</option>${A.chats.map(item => `<option value="${item.id}" ${item.id === chat?.id ? "selected" : ""}>${esc(item.title)} · ${item.id}</option>`).join("")}</select><button class="btn secondary" data-action="assistant-new">${svg("plus")}New conversation</button></div>`;
+  const actions = `<div class="flex"><button class="btn secondary" data-action="reports-open">Open reports folder</button><select id="assistant-history" aria-label="Open conversation"><option value="">Conversations</option>${A.chats.map(item => `<option value="${item.id}" ${item.id === chat?.id ? "selected" : ""}>${esc(item.title)} · ${item.id}</option>`).join("")}</select><button class="btn secondary" data-action="assistant-new">${svg("plus")}New conversation</button></div>`;
   if (!chat) return `${heading("Data assistant", "", actions)}${assistantEntry()}`;
-  return `${heading("Data assistant", "", actions)}${folderLocations(chat.folder, chat.bi_folder, chat.files)}<section class="data-conversation" aria-label="Conversation">${chat.turns.map(turn => `<article class="data-turn"><div class="data-user"><span class="data-speaker">You</span><div>${esc(turn.instruction)}</div></div><div class="data-response"><span class="data-speaker">Finance Flow</span>${turn.steps?.length ? `<details class="data-steps" ${turn.status === "running" ? "open" : ""}><summary>${turn.steps.length} steps</summary>${turn.steps.map(step => `<div class="data-step ${step.status === "error" ? "data-step-error" : ""}"><span>${svg(step.status === "error" ? "alert" : "check")}${esc(dataToolLabels[step.tool] || step.tool)}</span>${step.error ? `<p>${esc(step.error)}</p>` : step.result?.rows !== undefined ? `<span>${step.result.rows} rows${step.result.frame_id ? " · " + esc(step.result.frame_id) : ""}</span>` : ""}</div>`).join("")}</details>` : ""}${turn.status === "running" ? `<div class="data-working"><span class="busy"></span>Working locally<button class="btn ghost" data-action="assistant-cancel" data-turn="${turn.id}">Stop</button></div>` : ""}${turn.message ? `<div class="data-answer">${esc(turn.message)}</div>` : ""}${turn.error ? `<p class="error-text" role="alert">${esc(turn.error)}</p>` : ""}${assistantReviewCard(turn, Boolean(active))}${turn.status === "failed" && !turn.error ? '<p class="error-text">This request was interrupted. Saved results are available.</p>' : ""}${(turn.can_retry ?? ["failed", "cancelled"].includes(turn.status)) ? `<div class="data-send"><button class="btn secondary" data-action="assistant-retry" data-turn="${turn.id}" ${active || A.busy ? "disabled" : ""}>${svg("refresh")}Retry request</button></div>` : ""}</div></article>`).join("")}</section>${chat.preview ? assistantTable(chat.preview) : ""}${chat.charts.length ? `<section class="data-chart-grid">${chat.charts.map(chart => `<article class="card card-body"><h3>${esc(chart.title)}</h3>${assistantChart(chart)}</article>`).join("")}</section>` : ""}${chat.artifacts.length ? `<section class="card space"><div class="card-head"><h2>Reports</h2></div><div class="card-body data-reports">${[...chat.artifacts].reverse().map(item => `<div class="between"><span>${svg("file")} ${esc(item.title)}${item.row_count !== undefined ? ` · ${item.row_count} rows` : ""}</span><button class="btn secondary" data-action="assistant-export" data-artifact="${item.id}">${svg("download")}Save Excel</button></div>`).join("")}</div></section>` : ""}<section class="card data-composer"><form id="assistant-form" class="card-body"><label for="assistant-request">${active ? "Request in progress" : "Continue the conversation"}</label><textarea id="assistant-request" class="input command-input" required minlength="3" maxlength="3000" ${active || A.busy ? "disabled" : ""} placeholder="Now show only unpaid orders, sorted by amount.">${esc(A.draft)}</textarea><div class="data-send"><button class="btn primary" type="submit" ${active || A.busy ? "disabled" : ""}>Send ${svg("arrow")}</button></div>${A.error ? `<p class="error-text" role="alert">${esc(A.error)}</p>` : ""}</form></section>`;
+  return `${heading("Data assistant", "", actions)}${folderLocations(chat.folder, chat.bi_folder, chat.files)}${A.pollError?.chatId === chat.id ? `<div class="notice error" role="alert"><div><h3>Unable to refresh progress</h3><p>The conversation below is the last saved result. ${esc(A.pollError.message)}</p></div><button class="btn secondary" data-action="assistant-refresh">Refresh status</button></div>` : ""}<section class="data-conversation" aria-label="Conversation">${chat.turns.map(turn => `<article class="data-turn"><div class="data-user"><span class="data-speaker">You</span><div>${esc(turn.instruction)}</div></div><div class="data-response"><span class="data-speaker">Finance Flow</span>${turn.steps?.length ? `<details class="data-steps" ${turn.status === "running" ? "open" : ""}><summary>${turn.steps.length} steps</summary>${turn.steps.map(step => `<div class="data-step ${step.status === "error" ? "data-step-error" : ""}"><span>${svg(step.status === "error" ? "alert" : "check")}${esc(dataToolLabels[step.tool] || step.tool)}</span>${step.error ? `<p>${esc(step.error)}</p>` : step.result?.rows !== undefined ? `<span>${step.result.rows} rows${step.result.frame_id ? " · " + esc(step.result.frame_id) : ""}</span>` : ""}</div>`).join("")}</details>` : ""}${assistantProgress(turn)}${turn.message ? `<div class="data-answer">${esc(turn.message)}</div>` : ""}${turn.error ? `<p class="error-text" role="alert">${esc(turn.error)}</p>` : ""}${assistantReviewCard(turn, Boolean(active))}${turn.status === "failed" && !turn.error ? '<p class="error-text">This request was interrupted. Saved results are available.</p>' : ""}${(turn.can_retry ?? ["failed", "cancelled"].includes(turn.status)) ? `<div class="data-send"><button class="btn secondary" data-action="assistant-retry" data-turn="${turn.id}" ${active || A.busy ? "disabled" : ""}>${svg("refresh")}Retry request</button></div>` : ""}</div></article>`).join("")}</section>${chat.preview ? assistantTable(chat.preview) : ""}${chat.charts.length ? `<section class="data-chart-grid">${chat.charts.map(chart => `<article class="card card-body"><h3>${esc(chart.title)}</h3>${assistantChart(chart)}</article>`).join("")}</section>` : ""}${chat.artifacts.length ? `<section class="card space"><div class="card-head"><h2>Reports</h2></div><div class="card-body data-reports">${[...chat.artifacts].reverse().map(item => `<div class="between"><span>${svg("file")} ${esc(item.title)}${item.row_count !== undefined ? ` · ${item.row_count} rows` : ""}</span><button class="btn secondary" data-action="assistant-export" data-artifact="${item.id}">${svg("file")}Show report</button></div>`).join("")}</div></section>` : ""}<section class="card data-composer"><form id="assistant-form" class="card-body"><label for="assistant-request">${active ? "Request in progress" : "Continue the conversation"}</label><textarea id="assistant-request" class="input command-input" required minlength="3" maxlength="3000" ${active || A.busy ? "disabled" : ""} placeholder="Ask a follow-up about the results, or choose a starting point.">${esc(A.draft)}</textarea>${assistantExamples(Boolean(active) || A.busy)}<div class="data-send"><button class="btn primary" type="submit" ${active || A.busy ? "disabled" : ""}>Send ${svg("arrow")}</button></div>${A.error ? `<p class="error-text" role="alert">${esc(A.error)}</p>` : ""}</form></section>`;
 }
 
 function assistantReviewCard(turn, active) {
@@ -208,7 +242,23 @@ async function assistantSubmit() {
 }
 
 async function assistantAction(action, target) {
-  if (action === "assistant-new") {
+  if (action === "assistant-example") {
+    if (A.busy || A.chat?.active_turn) return;
+    const example = assistantTasks.find(item => item.id === target.dataset.example);
+    if (!example) return;
+    A.draft = example.request; A.error = "";
+    render();
+    document.getElementById("assistant-request")?.focus();
+  } else if (action === "assistant-refresh") {
+    const id = A.chat?.id;
+    if (!id) return;
+    target.disabled = true;
+    try {
+      const result = await refreshAssistantChat(id);
+      if (result.status === "error" && assistantViewingChat(id)) A.pollError = {chatId: id, message: result.error.message};
+      if (assistantViewingChat(id)) render();
+    } finally { target.disabled = false; }
+  } else if (action === "assistant-new") {
     A.chat = null; A.draft = ""; A.error = ""; A.selectedId = null; A.epoch += 1;
     go("assistant");
   }
@@ -238,20 +288,29 @@ async function assistantAction(action, target) {
       if (assistantFinishOperation(operation) && S.route === "assistant") render();
     }
   } else if (action === "assistant-cancel") {
-    await post(`/assistant/turns/${target.dataset.turn}/cancel`); target.disabled = true;
+    target.disabled = true;
+    const chatId = A.chat?.id;
+    try {
+      await post(`/assistant/turns/${target.dataset.turn}/cancel`);
+      if (assistantViewingChat(chatId)) {
+        const turn = A.chat.turns.find(item => item.id === Number(target.dataset.turn));
+        if (turn) turn.cancel_requested = true;
+        render();
+      }
+    } finally { target.disabled = false; }
   } else if (action === "assistant-review-export") {
     target.disabled = true;
     try {
       const result = await post(`/batches/${target.dataset.batch}/export`);
       if (result.download_url) { const link = document.createElement("a"); link.href = result.download_url; link.download = ""; document.body.append(link); link.click(); link.remove(); }
-      else if (result.saved) toast("Excel report saved.");
+      else if (result.saved) await openReportsFolder();
     } finally { target.disabled = false; }
   } else if (action === "assistant-export") {
     target.disabled = true;
     try {
       const result = await post(`/assistant/artifacts/${target.dataset.artifact}/export`);
       if (result.download_url) { const link = document.createElement("a"); link.href = result.download_url; link.download = ""; document.body.append(link); link.click(); link.remove(); }
-      else if (result.saved) toast("Excel report saved.");
+      else if (result.saved) await openReportsFolder();
     } finally { target.disabled = false; }
   }
 }
@@ -277,7 +336,10 @@ setInterval(async () => {
     const chat = await api("/assistant/chats/" + chatId);
     if (applyAssistantChat(chat, view, read)) render();
   } catch (error) {
-    if (assistantDetailReadCurrent(view, read)) toast(error.message, true);
+    if (assistantDetailReadCurrent(view, read)) {
+      A.pollError = {chatId, message: error.message};
+      render();
+    }
   }
   finally { A.polling = false; }
 }, 1200);

@@ -1,35 +1,44 @@
-"""Save generated reports through the desktop's native Save As dialog."""
+"""Keep generated reports in a separate folder, without a Save As dialog."""
 import os
+import filecmp
 from pathlib import Path
+import secrets
 import shutil
-import tempfile
-
-import webview
 
 
 def save_report(source, filename):
-    if not webview.windows:
-        return {"handled": False}
-    selected = webview.windows[0].create_file_dialog(
-        webview.FileDialog.SAVE, save_filename=filename,
-        file_types=("Excel workbook (*.xlsx)",))
-    if not selected:
-        return {"handled": True, "saved": False, "cancelled": True}
-    destination = Path(selected if isinstance(selected, str) else selected[0])
-    if not destination.is_absolute():
-        raise ValueError("Choose a complete local destination path.")
-    if not destination.suffix:
-        destination = destination.with_suffix(".xlsx")
-    if destination.suffix.lower() != ".xlsx":
-        raise ValueError("Save the report with an .xlsx filename.")
-    if destination.resolve() != Path(source).resolve():
-        temporary = None
-        try:
-            with tempfile.NamedTemporaryFile(dir=destination.parent, prefix=".financeflow-", suffix=".xlsx", delete=False) as handle:
-                temporary = Path(handle.name)
-            shutil.copyfile(source, temporary)
-            os.replace(temporary, destination)
-        finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
-    return {"handled": True, "saved": True, "path": str(destination)}
+    source = Path(source).resolve(strict=True)
+    folder = source.parent if source.parent.name == "Reports" else source.parent / "Reports"
+    folder.mkdir(exist_ok=True)
+    destination = folder / source.name
+    if destination != source:
+        if destination.is_file() and filecmp.cmp(source, destination, shallow=False):
+            return {"handled": True, "saved": True, "path": str(destination), "folder": str(folder)}
+        # Keep legacy originals intact so stored hashes and old links stay valid.
+        for _ in range(10):
+            try:
+                with destination.open("xb") as target:
+                    try:
+                        with source.open("rb") as original:
+                            shutil.copyfileobj(original, target)
+                    except BaseException:
+                        # Close before unlink on Windows.
+                        target.close()
+                        destination.unlink(missing_ok=True)
+                        raise
+                break
+            except FileExistsError:
+                destination = folder / f"{source.stem}-{secrets.token_hex(5)}{source.suffix}"
+        else:
+            raise OSError("A unique report filename could not be created.")
+    return {"handled": True, "saved": True, "path": str(destination), "folder": str(folder)}
+
+
+def open_report_folder(folder):
+    folder = Path(folder).resolve(strict=True)
+    if not folder.is_dir():
+        raise ValueError("The report folder was not found.")
+    if os.name == "nt":
+        os.startfile(str(folder))
+        return {"opened": True, "path": str(folder)}
+    return {"opened": False, "path": str(folder)}

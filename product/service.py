@@ -279,6 +279,16 @@ class ProductService:
         self.store.event(job_id, "Task created", "Source and BI reference snapshots are attached.")
         return self.detail(job_id)
 
+    @serialized
+    def quick_start(self, title, source_id, reference_id, actor):
+        """One explicit start uses fixed rules; findings still require human review."""
+        if self.active is not None or self.batch_active is not None or self.assistant_active is not None:
+            raise HTTPException(409, "Another task is using the local worker. Wait for it to finish.")
+        task = self.create(title, "Reconcile these orders against the imported BI reference. "
+                           "Hold differences for human review and archive only reconciled results.",
+                           source_id, reference_id, False)
+        return self.schedule(task["id"], "quick", actor)
+
     def schedule(self, job_id, operation, actor):
         with self.guard:
             self.check_archive_recovery(job_id)
@@ -299,6 +309,8 @@ class ProductService:
                     raise HTTPException(409, "Review the existing task before changing its plan.")
                 state.update(plan_status="generating", error=None, stage="Generating local plan")
                 self.store.save_job(job, state, "pending")
+            state["operation_started_at"] = timestamp()
+            self.store.save_job(job, state, "running" if operation == "run" else "pending")
             self.active = job_id
             self.cancel_signal.clear()
             self.future = self.executor.submit(self._work, job_id, operation, actor)
@@ -306,7 +318,7 @@ class ProductService:
 
     def _work(self, job_id, operation, actor):
         try:
-            if operation == "plan":
+            if operation in ("plan", "quick"):
                 job, state = self.get_job(job_id)
                 if state["ai"]:
                     plan = self.model.plan(job["instruction"], str(self.path(state["working_file"])))
@@ -320,6 +332,15 @@ class ProductService:
                 state.update(plan=plan, plan_status="ready", stage="Plan ready for approval")
                 self.store.save_job(job, state, "pending")
                 self.store.event(job_id, "Plan generated", plan["summary"], details={"mode": plan["mode"], "model": plan["model"]})
+                if operation == "quick":
+                    if self.cancel_signal.is_set():
+                        raise Cancelled()
+                    state.update(stage="Starting reconciliation")
+                    self.store.save_job(job, state, "running")
+                    self.store.event(job_id, "Quick reconciliation authorized",
+                                     "The user started the fixed reconciliation workflow; differences require human review.",
+                                     details={"actor": actor, "revision": job["revision"]})
+                    self.execute(job_id, actor)
             else:
                 self.execute(job_id, actor)
         except Cancelled:
@@ -372,10 +393,12 @@ class ProductService:
                 runtime.current_trace = trace
                 if service.cancel_signal.is_set():
                     raise Cancelled()
-                result_value, decision = super()._execute(tool, arguments, trace)
                 current, saved = service.get_job(job_id)
                 labels = {"read_data_file": "Read source file", "validate_data": "Validate and compare", "query_bi": "Query BI reference", "submit_to_oa": "Archive reconciled record"}
                 saved["stage"] = labels.get(str(tool), str(tool))
+                service.store.save_job(current, saved, "running")
+                result_value, decision = super()._execute(tool, arguments, trace)
+                current, saved = service.get_job(job_id)
                 if str(tool) == "read_data_file":
                     saved["records"] = result_value["records"]
                 if str(tool) == "validate_data":
@@ -675,6 +698,7 @@ class ProductService:
                        archive_count=state["archive_count"], stage=state["stage"], error=state["error"],
                        plan=state["plan"], plan_status=state["plan_status"], ai=state["ai"],
                        cancel_requested=state["cancel_requested"],
+                       operation_started_at=state.get("operation_started_at"),
                        evidence_digest=self.review_evidence(job, state) if job["status"] == "waiting_confirmation" else state["evidence_digest"],
                        source_sha256=source["sha256"], reference_sha256=reference["sha256"])
         if full:

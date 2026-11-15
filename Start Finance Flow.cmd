@@ -5,5 +5,5 @@ if not exist ".venv\Scripts\python.exe" (
   pause
   exit /b 1
 )
-".venv\Scripts\python.exe" start_product.py
+".venv\Scripts\python.exe" start_product.py --demo
 if errorlevel 1 pause
